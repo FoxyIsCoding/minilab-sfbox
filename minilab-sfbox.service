@@ -1,0 +1,17 @@
+[Unit]
+Description=minilab-sfbox headless SF2 player
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/minilab-sfbox
+ExecStart=/usr/bin/python3 /opt/minilab-sfbox/app.py
+Restart=always
+RestartSec=3
+Nice=-10
+LimitRTPRIO=80
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

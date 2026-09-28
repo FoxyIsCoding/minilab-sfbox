@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+state.json
+soundfonts/*.sf2
+soundfonts/*.sf3
+soundfonts/*.SF2
+soundfonts/*.SF3
+!soundfonts/.gitkeep
