@@ -207,11 +207,37 @@ def rel2_delta(value: int) -> int:
     return value if value < 64 else value - 128
 
 
-def fx_accumulate(current: int, msg_value: int, knob_mode: str) -> int:
-    """Next 0..127 accumulator for an FX knob (absolute sets, relative nudges)."""
+def fx_accumulate(current: int, msg_value: int, knob_mode: str,
+                  top: int = 127) -> int:
+    """Next 0..top accumulator for an FX knob (absolute sets, relative nudges)."""
     if knob_mode.startswith("rel"):
-        return max(0, min(127, current + rel2_delta(msg_value)))
-    return max(0, min(127, msg_value))
+        return max(0, min(top, current + rel2_delta(msg_value)))
+    return max(0, min(top, round(msg_value / 127 * top)))
+
+
+def fx_pct(value: int) -> int:
+    """FX knob value -> percent of unity. 127 == 100%, so boosters read >100%."""
+    return round(value / 127 * 100)
+
+
+def bass_levels(knob_value: int, velocity: int):
+    """Bass booster knob (0..254, unity 127) -> [(octave_shift, velocity)].
+
+    0-100%  : one sub-octave (-12), scaled with the knob.
+    100-150%: -12 at full + a second layer (-24) fading in.
+    150-200%: -24 up to 80% of the played velocity, for a proper deep boost.
+    """
+    pct = fx_pct(knob_value)
+    subs = []
+    if pct > 0 and velocity > 0:
+        v1 = int(velocity * min(1.0, pct / 100))
+        if v1 > 0:
+            subs.append((-12, min(127, v1)))
+        if pct > 100:
+            v2 = int(velocity * 0.8 * min(1.0, (pct - 100) / 100))
+            if v2 > 0:
+                subs.append((-24, min(127, v2)))
+    return subs
 
 
 def pan_label(v: int) -> str:
@@ -239,8 +265,26 @@ def build_volume_cmd(pct: int, backend: str = "auto",
 FX_DEFS = ("reverb", "room", "damp", "chorus",
            "bass", "bright", "attack", "release")
 FX_TITLES = {"reverb": "Reverb", "room": "RoomSize", "damp": "Damp",
-             "chorus": "Chorus", "bass": "Bass", "bright": "Bright",
+             "chorus": "Chorus", "bass": "BassBoost", "bright": "Bright",
              "attack": "Attack", "release": "Release"}
+
+# display modes reachable from the encoder menu (double-click the encoder).
+# (key, label, one-line help shown under the highlighted entry)
+MODES = (
+    ("instruments", "Instruments", "browse all presets"),
+    ("soundfonts", "SoundFonts", "jump to a whole .sf2"),
+    ("favorites", "Favorites", "your starred presets"),
+    ("star", "* Star", "favourite the current one"),
+    ("volume", "Master Vol", "encoder = loudness 0-125%"),
+    ("close", "Close", "back to playing"),
+)
+MODE_HELP = {k: h for k, _, h in MODES}
+MODE_LABEL = {k: n for k, n, _ in MODES}
+
+
+def fav_key(p):
+    """Stable favourite identity (survives library rebuilds/reorderings)."""
+    return f"{os.path.basename(p['file'])}|{p['bank']}|{p['prog']}"
 
 
 def partition_files(files_sizes, preload_max_mb: float):
@@ -278,7 +322,6 @@ class Player:
         self.sf_files = find_soundfonts(self.sf_dir)
         self.lib = build_library(self.sf_files)
         self.idx = 0
-        self._load_state()
         self.bank_msb = 0
         self.bank_lsb = 0
         self.mido = None
@@ -298,6 +341,11 @@ class Player:
         # encoder push-to-confirm (discovered per unit; 0 = disabled)
         self.click_note = int(cfg_get(config, "controls", "encoder_click_note", "0"))
         self.click_cc = int(cfg_get(config, "controls", "encoder_click_cc", "0"))
+        # click timing (ms): single = confirm, double = menu, long = favourite
+        self.click_single_ms = int(cfg_get(config, "controls", "click_single_ms", "350"))
+        self.click_double_ms = int(cfg_get(config, "controls", "click_double_ms", "400"))
+        self.click_long_ms = int(cfg_get(config, "controls", "click_long_ms", "800"))
+        self.pad_channel = int(cfg_get(config, "controls", "pad_channel", "9"))
         self.confirm_on_note = cfg_get(config, "confirm", "on_note",
                                        "true").strip().lower() in ("1", "true", "yes", "on")
         # audition blip after a preset loads + subtle ding for volume test
@@ -335,16 +383,33 @@ class Player:
         self.pan_cc = int(cfg_get(config, "pan", "cc", "0"))
         self.pan = 64
 
-        # fx knobs: name -> cc, accumulator 0..127
+        # fx knobs: name -> cc, accumulator 0..fx_top[name]
         self.fx_cc = {}
         self.fx_val = {}
+        self.fx_top = {}
         for name in FX_DEFS:
             cc = int(cfg_get(config, "fx", f"cc_{name}", "0"))
+            top = max(1, int(cfg_get(config, "fx", f"top_{name}", "127")))
             self.fx_cc[name] = cc
-            self.fx_val[name] = 64
+            self.fx_top[name] = top
+            # start position: def_{name} percent of travel (50% unless set),
+            # where 100% of unity sits at 50% travel for over-range boosters.
+            pct0 = int(cfg_get(config, "fx", f"def_{name}",
+                               "25" if top > 127 else "50"))
+            self.fx_val[name] = max(0, min(top, round(top * pct0 / 100)))
         self.shell = fluidmod.FluidShell()
-        self._subs = {}  # (channel, note) -> sub-bass note (app-side octave layer)
-        # background preset loader: display updates instantly, synth loads async
+        self._subs = {}  # (channel, note) -> [sub notes] (bass booster layers)
+        # display menu: mode browsing, favourites
+        self.mode = cfg_get(config, "menu", "mode", "instruments").strip().lower()
+        if self.mode not in MODE_LABEL:
+            self.mode = "instruments"
+        self.menu_open = False
+        self.menu_idx = [k for k, _, _ in MODES].index(self.mode)
+        self.favs = []  # library indices, kept sorted + de-duplicated
+        self._press = None      # pending click: {'t':..,'long':bool}
+        self._last_click_t = 0.0
+        self._menu_hold_until = 0.0
+        self._menu_saved = None  # (mode,) restored when leaving the menu
         # background preset loader: display updates instantly, synth loads async
         self._load_q = queue.Queue(maxsize=8)
         self._last_show = 0.0
@@ -376,22 +441,66 @@ class Player:
         self._font_lock = threading.Lock()
         self._font_gen = 0     # bumped on synth respawn; stale loads discarded
         self.fluid_log = os.path.join(HERE, "fluid.log")
+        # last: restore saved index/mode/favourites now that every knob,
+        # the menu and the library all exist
+        self._load_state()
 
     # -- state --
     def _load_state(self):
+        self.favs = []
         try:
             with open(STATE_PATH) as f:
                 st = json.load(f)
             self.idx = max(0, min(len(self.lib) - 1, int(st.get("index", 0))))
+            mode = st.get("mode", "instruments")
+            if mode in MODE_LABEL:
+                self.mode = mode
+                self.menu_idx = [k for k, _, _ in MODES].index(mode)
+            self._restore_favs(st.get("favs", []))
         except Exception:
             self.idx = 0
+        self._sync_highlight()
+
+    def _restore_favs(self, keys):
+        """Re-attach saved favourite keys to this build's library indices."""
+        by_key = {fav_key(p): i for i, p in enumerate(self.lib)}
+        got = [by_key[k] for k in keys if k in by_key]
+        self.favs = sorted(set(got))
 
     def _save_state(self):
         try:
             with open(STATE_PATH, "w") as f:
-                json.dump({"index": self.idx}, f)
+                json.dump({"index": self.idx,
+                           "mode": self.mode,
+                           "favs": [fav_key(self.lib[i])
+                                    for i in sorted(set(self.favs))
+                                    if i < len(self.lib)]}, f)
         except OSError:
             pass
+
+    # -- favourites --
+    def is_fav(self, idx: int) -> bool:
+        return idx in self.favs
+
+    def toggle_fav(self, idx: int) -> bool:
+        """Star/unstar a library index. Returns the new state."""
+        if idx is None or not (0 <= idx < len(self.lib)):
+            return False
+        if idx in self.favs:
+            self.favs.remove(idx)
+            new = False
+        else:
+            self.favs.append(idx)
+            self.favs.sort()
+            new = True
+        self._save_state()
+        p = self.lib[idx]
+        print(f"{'favourited' if new else 'unfavourited'}: "
+              f"{p['sf']} | {p['name']} ({len(self.favs)} total)", flush=True)
+        self.popup("Favourites",
+                   ("* " if new else "- ") + p["name"][:24],
+                   len(self.favs) * 127 // max(1, len(self.lib)))
+        return new
 
     # -- fluidsynth --
     def start_fluid(self):
@@ -600,7 +709,8 @@ class Player:
         self.pending_idx = max(0, min(len(self.lib) - 1, idx))
         now = time.time()
         if now - self._last_show >= 0.03:  # keep fast spins fluid
-            p = self.lib[self.pending_idx]
+            p = dict(self.lib[self.pending_idx])
+            p["_i"] = self.pending_idx
             self.show(p, pending=True)
             self._last_show = now
 
@@ -610,8 +720,71 @@ class Player:
             return False
         if via:
             print(f"confirmed via {via}: ", flush=True, end="")
+        if self.mode == "soundfonts":
+            p = self.lib[self.pending_idx]
+            print(f"soundfont -> {p['file']}", flush=True)
+            self.apply(self.pending_idx)
+            self.mode = "instruments"
+            self._save_state()
+            self._sync_highlight()
+            return True
         self.apply(self.pending_idx)
         self.pending_idx = None
+        return True
+
+    # -- encoder click gestures: single = confirm, double = menu, long = star --
+    def _click_press(self):
+        """Handle a press of the encoder's push button."""
+        now = time.time()
+        if self._press is not None:  # second press while waiting = double
+            self._press = None
+            return self._double_click()
+        self._press = {"t": now, "long": False}
+        return False
+
+    def _double_click(self):
+        self._last_click_t = 0.0
+        if self.menu_open:
+            self._close_menu()
+        else:
+            self._open_menu()
+        return True
+
+    def _click_tick(self):
+        """Resolve a held encoder press into long-press (favourite)."""
+        p = self._press
+        if p is None or p["long"]:
+            return
+        held = (time.time() - p["t"]) * 1000
+        if held < self.click_long_ms:
+            return
+        self._press = None
+        self._last_click_t = 0.0
+        if self.menu_open:
+            return
+        print(f"long press ({held:.0f}ms) -> favourite", flush=True)
+        self.toggle_fav(self.pending_idx if self.pending_idx is not None
+                        else self.idx)
+
+    def _click_release(self):
+        """Handle the release: single click unless a double/long already ran."""
+        p = self._press
+        if p is None:
+            return False
+        self._press = None
+        held = (time.time() - p["t"]) * 1000
+        if held >= self.click_long_ms:
+            return True  # long press already handled
+        now = time.time()
+        if self._last_click_t and (now - self._last_click_t) * 1000 < \
+                self.click_double_ms:
+            self._last_click_t = 0.0
+            return self._double_click()
+        self._last_click_t = now
+        if self.menu_open:
+            self._menu_choose()
+        else:
+            self._confirm("encoder click")
         return True
 
     def _push_channel_ccs(self):
@@ -633,16 +806,9 @@ class Player:
     def popup(self, title: str, text: str, value: int):
         """Stock-looking knob popup on the MiniLab display (autohide)."""
         print(f"{title}: {text}", flush=True)
-        if self.ml_out is None:
-            return
-        try:
-            msg = disp.msg_info(title[:16], text[:28],
-                                max(0, min(127, value)),
-                                control="knob", autohide=True)
-            self.ml_out.send(
-                self.mido.Message("sysex", data=list(msg[1:-1])))
-        except Exception:
-            pass
+        self._send(disp.msg_info(title[:16], text[:28],
+                                 max(0, min(127, value)),
+                                 control="knob", autohide=True))
 
     # -- volume / pan / fx actions (all consumed, not forwarded) --
     def _do_volume(self, v127: int):
@@ -703,6 +869,7 @@ class Player:
                 and now - self._vol_ding_at >= 0.35):
             self._vol_ding_armed = False
             self._blip(self.ding_note, self.ding_vel, self.ding_ms)
+        self._click_tick()
 
     def _do_pan(self, v127: int):
         self.pan = v127
@@ -715,9 +882,11 @@ class Player:
                 pass
         self.popup("Pan", pan_label(v127), v127)
 
-    def _do_fx(self, name: str, v127: int):
-        self.fx_val[name] = v127
-        f01 = v127 / 127
+    def _do_fx(self, name: str, value: int):
+        """Apply an FX knob. value is 0..fx_top[name] (bass goes past 127)."""
+        top = self.fx_top.get(name, 127)
+        self.fx_val[name] = max(0, min(top, value))
+        f01 = self.fx_val[name] / 127
         if name == "reverb":
             self.shell.reverb_level(f01)
         elif name == "room":
@@ -733,11 +902,12 @@ class Player:
                     for ch in range(16):
                         self.fs_out.send(self.mido.Message(
                             "control_change", channel=ch, control=cc,
-                            value=v127))
+                            value=min(127, self.fx_val[name])))
                 except Exception:
                     pass
-        # bass is app-side (sub-octave layer in extra_for), nothing to send
-        self.popup(FX_TITLES[name], f"{round(f01 * 100)}%", v127)
+        # bass is app-side (sub-octave layers in extra_for), nothing to send
+        self.popup(FX_TITLES[name], f"{fx_pct(self.fx_val[name])}%",
+                   int(127 * self.fx_val[name] / top))
 
     def _sync_fx_from_synth(self):
         """Best-effort: align knob accumulators with fluidsynth state."""
@@ -756,46 +926,157 @@ class Player:
         except Exception:
             pass
 
+    # -- display views -------------------------------------------------------
+    # All browse modes walk the same (lib index) list machinery; `self.view()`
+    # is what the current mode lets you scroll through.
+    def view(self):
+        """Library indices browsable in the current mode."""
+        if self.mode == "favorites":
+            return sorted(self.favs)
+        if self.mode == "soundfonts":
+            first = {}
+            for i, p in enumerate(self.lib):
+                first.setdefault(p["sfont"], i)
+            return [first[k] for k in sorted(first)]
+        return list(range(len(self.lib)))
+
+    def view_total(self):
+        return len(self.view())
+
+    def _sync_highlight(self):
+        """Point pending_idx at the loaded preset inside the current view."""
+        if self.menu_open:
+            return
+        v = self.view()
+        if not v:
+            self.pending_idx = None
+            return
+        self.pending_idx = self.idx if self.idx in v else v[0]
+
     def show(self, p, pending=False):
-        total = len(self.lib)
+        self.render(p, pending)
+
+    def render(self, p, pending=False):
+        total = self.view_total() or 1
+        v = self.view()
+        try:
+            pos = v.index(p.get("_i", self.idx))
+        except ValueError:
+            pos = 0
+        star = "*" if self.is_fav(p.get("_i", self.idx)) else " "
+        mode_tag = {"instruments": "ALL", "favorites": "FAV",
+                    "soundfonts": "SF"}.get(self.mode, self.mode[:3].upper())
         l1 = f"{p['sf']}"[:16]
-        pi = getattr(self, "pending_idx", None)
-        pos = pi if (pending and pi is not None) else self.idx
-        if pending and pi is not None:
-            l2 = f"> {pi + 1}/{total} {p['name']}"[:28]
+        if pending:
+            l2 = f">{star} {mode_tag} {p['name']}"[:28]
         else:
-            l2 = f"{self.idx + 1}/{total} {p['name']}"[:28]
-        print(f"[{self.idx + 1}/{total}] {p['sf']} | "
+            l2 = f" {star} {mode_tag} {p['name']}"[:28]
+        print(f"[{pos + 1}/{total}] {p['sf']} | "
               f"bank {p['bank']} prog {p['prog']} | {p['name']}" +
               (" (browsing)" if pending else ""), flush=True)
         if self.ml_out is None:
             return
+        self._send(disp.msg_scroll(l1, l2, min(pos, 126), min(total, 127)))
+
+    def _send(self, msg):
+        """Push one display message (the MiniLab needs the init poke first)."""
+        if self.ml_out is None:
+            return
         try:
-            val = int(127 * (pos + 1) / max(1, total))
             self.ml_out.send(
                 self.mido.Message("sysex",
                                   data=list(disp.msg_init()[1:-1])))
-            msg = disp.msg_scroll(l1, l2, min(pos, 126),
-                                  min(total, 127))
-            # float knob graphic instead if single-soundfont GM set
-            if total <= 128:
-                msg = disp.msg_info(l1, l2, val, control="knob")
             self.ml_out.send(
                 self.mido.Message("sysex", data=list(msg[1:-1])))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"display send failed: {e}", flush=True)
+
+    def show_menu(self):
+        """Draw the mode menu (double-click the encoder to get here).
+
+        Line 1 = highlighted mode, line 2 = position + what it does, and the
+        scroll bar tracks position within the list so it reads as a real list.
+        """
+        keys = [k for k, _, _ in MODES]
+        n = len(keys)
+        self.menu_idx %= n
+        key = keys[self.menu_idx]
+        label = MODE_LABEL[key]
+        print(f"menu {self.menu_idx + 1}/{n}: > {label} - {MODE_HELP[key]}",
+              flush=True)
+        l1 = f"{self.menu_idx + 1}/{n} {label}"[:16]
+        l2 = MODE_HELP[key][:28]
+        self._send(disp.msg_scroll(l1, l2, min(self.menu_idx, 126),
+                                   min(n, 127)))
+
+    def _menu_choose(self):
+        """Activate the highlighted menu entry."""
+        keys = [k for k, _, _ in MODES]
+        key = keys[self.menu_idx % len(keys)]
+        if key == "close":
+            self._close_menu()
+            return
+        if key == "star":
+            self._close_menu()
+            self.toggle_fav(self.pending_idx if self.pending_idx is not None
+                            else self.idx)
+            return
+        self.mode = key
+        self._save_state()
+        self._close_menu(after=True)
+        if key == "soundfonts":
+            print(f"mode: {MODE_LABEL[key]} - {MODE_HELP[key]}", flush=True)
+        self._sync_highlight()
+        self._render_current()
+
+    def _open_menu(self):
+        keys = [k for k, _, _ in MODES]
+        if self.mode in keys:
+            self.menu_idx = keys.index(self.mode)
+        self._menu_saved = self.mode
+        self.menu_open = True
+        print("menu open (turn to choose, click to enter, Esc/close to leave)",
+              flush=True)
+        self.show_menu()
+
+    def _close_menu(self, after=False):
+        if not self.menu_open:
+            return
+        self.menu_open = False
+        if not after and self._menu_saved:
+            self.mode = self._menu_saved
+        self._menu_saved = None
+        self._sync_highlight()
+        self._render_current()
+
+    def _render_current(self):
+        v = self.view()
+        if not v:
+            return
+        i = self.pending_idx if self.pending_idx is not None else self.idx
+        p = dict(self.lib[i])
+        p["_i"] = i
+        self.render(p, pending=self.pending_idx is not None)
 
     def _browse_step(self, delta: int):
         """Encoder/knob browsing: move highlight, never load (click confirms)."""
-        if not self.lib:
+        v = self.view()
+        if not v:
             return
         base = self.pending_idx if self.pending_idx is not None else self.idx
-        self._browse_to((base + delta) % len(self.lib))
+        if base not in v:
+            base = v[0]
+        self._browse_to(v[(v.index(base) + delta) % len(v)])
 
-    def _browse_absolute(self, v: int):
-        if not self.lib:
+    def _browse_absolute(self, v127: int):
+        v = self.view()
+        if not v:
             return
-        self._browse_to(int(v / 128 * len(self.lib)))
+        self._browse_to(v[min(len(v) - 1, int(v127 / 128 * len(v)))])
+
+    def _menu_step(self, delta: int):
+        self.menu_idx = (self.menu_idx + delta) % len(MODES)
+        self.show_menu()
 
     def step(self, delta, quiet=False):
         if not self.lib:
@@ -806,38 +1087,68 @@ class Player:
         """Jump to the first preset of the prev/next soundfont file."""
         if not self.lib:
             return
-        cur_sf = self.lib[self.idx]["sfont"]
         sfonts = sorted({p["sfont"] for p in self.lib})
         if len(sfonts) < 2:
             self.popup("SoundFont", self.lib[self.idx]["sf"],
                        int(self.idx / max(1, len(self.lib)) * 127))
             return
+        cur_sf = self.lib[self.idx]["sfont"]
         target = sfonts[(sfonts.index(cur_sf) + direction) % len(sfonts)]
         for j, p in enumerate(self.lib):
             if p["sfont"] == target:
                 print(f"soundfont -> {p['file']}", flush=True)
-                self.apply(j)
+                if self.mode == "soundfonts":  # stay in the soundfont list
+                    self.idx = j
+                    self.pending_idx = j
+                    p2 = dict(p)
+                    p2["_i"] = j
+                    self.render(p2, pending=True)
+                else:
+                    self.apply(j)
                 return
 
-    def _browse_encoder(self, v: int):
-        """Main encoder below the display: highlight only, click loads."""
-        if not self.lib:
-            return
+    def _encoder_delta(self, v: int):
+        """Turn one encoder CC into a step direction, or None if it is a
+        position instead.
+
+        'auto' guesses: Arturia binary-offset relatives live at 60..68, so
+        anything in that band is a step and everything else is a position.
+        """
         m = self.encoder_mode
         if m == "absolute":
-            self._browse_absolute(v)
-            return
+            return None
         if m.startswith("rel"):
             d = rel2_delta(v)
-            if d != 0:
-                self._browse_step(1 if d > 0 else -1)
-            return
-        # auto: binary-offset relatives live at 60..68, anything else is absolute
-        if 60 <= v <= 68:
-            if v != 64:
-                self._browse_step(1 if v > 64 else -1)
+        elif 60 <= v <= 68:
+            d = 0 if v == 64 else (1 if v > 64 else -1)
         else:
+            return None
+        return 1 if d > 0 else (-1 if d < 0 else 0)
+
+    def _browse_encoder(self, v: int):
+        """Main encoder below the display: highlight only, click loads.
+
+        In volume mode it drives loudness instead; in the menu it scrolls.
+        """
+        if self.menu_open:
+            d = self._encoder_delta(v)
+            if d is None:
+                self.menu_idx = min(len(MODES) - 1,
+                                    int(v / 128 * len(MODES)))
+                self.show_menu()
+            elif d != 0:
+                self._menu_step(d)
+            return
+        if self.mode == "volume":
+            self._do_volume(v)
+            return
+        if not self.lib:
+            return
+        d = self._encoder_delta(v)
+        if d is None:
             self._browse_absolute(v)
+        elif d != 0:
+            self._browse_step(d)
 
     def _preview_note(self, port, note: int, vel: int, ms: int):
         """Audition blip after a preset loads (worker thread)."""
@@ -925,23 +1236,39 @@ class Player:
             for name in FX_DEFS:
                 if msg.control == self.fx_cc.get(name):
                     self._do_fx(name, fx_accumulate(
-                        self.fx_val[name], msg.value, self.knob_mode))
+                        self.fx_val[name], msg.value, self.knob_mode,
+                        self.fx_top.get(name, 127)))
                     return True
             if msg.control == self.encoder_cc and self.encoder_cc:
                 self._browse_encoder(msg.value)
                 return True
             if msg.control == self.preset_cc:
-                # preset knob browses too (highlight; click loads)
+                # preset knob browses too (highlight; click loads). While the
+                # menu is open it scrolls the menu instead.
+                if self.menu_open:
+                    if self.knob_mode.startswith("rel"):
+                        d = rel2_delta(msg.value)
+                        if d != 0:
+                            self._menu_step(1 if d > 0 else -1)
+                    elif self.knob_mode == "absolute":
+                        self.menu_idx = min(
+                            len(MODES) - 1, int(msg.value / 128 * len(MODES)))
+                        self.show_menu()
+                    return True  # consume: don't send filter jumps to synth
                 if self.knob_mode.startswith("rel"):
                     d = rel2_delta(msg.value)
                     if d != 0:
                         self._browse_step(1 if d > 0 else -1)
-                else:  # absolute: map 0..127 across library
-                    if self.lib:
+                else:  # absolute: map 0..127 across the current view
+                    if self.view():
                         self._browse_absolute(msg.value)
                 return True  # consume: don't send filter jumps to synth
             if self.click_cc and msg.control == self.click_cc:
-                self._confirm("encoder click")
+                # 127 = pressed, 0 = released (Arturia button convention)
+                if msg.value >= 64:
+                    self._click_press()
+                else:
+                    self._click_release()
                 return True
             return False
         if t == "program_change":
@@ -959,10 +1286,14 @@ class Player:
                         self.apply(msg.program)
             return True
         if t in ("note_on", "note_off"):
+            if self.click_note and msg.note == self.click_note:
+                # pads-channel press/release pair -> click gestures
+                if t == "note_on" and msg.velocity > 0:
+                    self._click_press()
+                elif t == "note_off" or msg.velocity == 0:
+                    self._click_release()
+                return True
             if t == "note_on" and msg.velocity > 0:
-                if self.click_note and msg.note == self.click_note:
-                    self._confirm("encoder click")
-                    return True
                 if msg.note == self.prev_note:
                     self.step(-1)
                     return True
@@ -975,6 +1306,11 @@ class Player:
                 if msg.note == self.sf_next_note:
                     self.step_soundfont(1)
                     return True
+                if (msg.channel == self.pad_channel
+                        and self.click_note == 0):
+                    # unassigned pad: treat as encoder click gestures
+                    self._click_press() if msg.velocity > 0 else None
+                    return True
                 # keys audition the highlight (loads it first) when enabled
                 if (self.pending_idx is not None and self.confirm_on_note
                         and msg.channel == 0):
@@ -983,34 +1319,38 @@ class Player:
         return False
 
     def extra_for(self, msg):
-        """Extra messages to inject alongside a forwarded one (sub-bass layer).
+        """Extra messages to inject alongside a forwarded one (bass booster).
 
-        Returns a list (usually empty). Tracks (channel, note) -> sub note
+        Returns a list (usually empty). Tracks (channel, note) -> sub notes
         so releases always match, even on retrigger or all-notes-off gaps.
         """
         out = []
         if msg.type == "note_on" and msg.velocity > 0:
             key = (msg.channel, msg.note)
-            old = self._subs.pop(key, None)
-            if old is not None:
+            old = self._subs.pop(key, None) or []
+            for n in old:
                 out.append(self.mido.Message("note_off", channel=msg.channel,
-                                             note=old, velocity=0))
-            level = self.fx_val.get("bass", 0) if self.fx_cc.get("bass") else 0
-            if level > 0 and msg.note >= 12:
-                subvel = int(msg.velocity * level / 127)
-                if subvel > 0:
-                    sub = msg.note - 12
-                    self._subs[key] = sub
-                    out.append(self.mido.Message(
-                        "note_on", channel=msg.channel,
-                        note=sub, velocity=subvel))
+                                             note=n, velocity=0))
+            if not self.fx_cc.get("bass") or msg.note < 12:
+                return out
+            subs = bass_levels(self.fx_val.get("bass", 0), msg.velocity)
+            made = []
+            for shift, vel in subs:
+                n = msg.note + shift
+                if n < 0:
+                    continue
+                made.append(n)
+                out.append(self.mido.Message("note_on", channel=msg.channel,
+                                             note=n, velocity=vel))
+            if made:
+                self._subs[key] = made
         elif msg.type == "note_off" or (msg.type == "note_on" and
                                         msg.velocity == 0):
             key = (msg.channel, msg.note)
-            old = self._subs.pop(key, None)
-            if old is not None:
+            old = self._subs.pop(key, None) or []
+            for n in old:
                 out.append(self.mido.Message("note_off", channel=msg.channel,
-                                             note=old, velocity=0))
+                                             note=n, velocity=0))
         return out
 
     def _close_ports(self):
@@ -1064,8 +1404,18 @@ class Player:
                     loader_started = True
                 self.apply(self.idx)
                 self._warm_current()
-                self.popup("sfbox ready",
-                           f"{len(self.sf_files)}SF {len(self.lib)} presets")
+                self._sync_highlight()
+                self._render_current()
+                self.popup("sfbox ready", f"{len(self.lib)} presets",
+                           min(127, len(self.lib)))
+                if self.click_note or self.click_cc:
+                    print("  click = confirm, double-click = menu, "
+                          "long press = favourite", flush=True)
+                else:
+                    print("  NOTE: encoder click unmapped - double-click/"
+                          "long-press gestures are off. Find it with "
+                          "'python3 tools/sniff.py 30' and set "
+                          "encoder_click_note/cc in config.ini.", flush=True)
                 print("Ready. Scroll to browse, click to load. "
                       "Ctrl-C to stop.", flush=True)
                 last_watch = time.time()

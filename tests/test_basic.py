@@ -92,8 +92,8 @@ for token in ["-is", "-a alsa", "-m alsa_seq", "shell.port",
 # 6. handle(): knob/pads/program consume vs forward
 sys.path.insert(0, os.path.join(HERE, ".."))
 import configparser
-from app import (Player, load_config, fx_accumulate, pan_label,
-                 build_volume_cmd)
+from app import (Player, load_config, fx_accumulate, fx_pct, pan_label,
+                 build_volume_cmd, fav_key, MODES)
 import fluid as fluidmod2
 c = configparser.ConfigParser()
 c.read(os.path.join(HERE, "..", "config.ini"))
@@ -127,11 +127,21 @@ p.pan_cc, p.pan = 33, 64
 p.fx_cc = {"reverb": 71, "room": 72, "damp": 73, "chorus": 74,
            "bass": 75, "bright": 76, "attack": 77, "release": 78}
 p.fx_val = {k: 64 for k in p.fx_cc}
+p.fx_top = {k: 127 for k in p.fx_cc}
+p.fx_top["bass"] = 254
+p.fx_val["bass"] = 64
 p.shell = fluidmod2.FluidShell()
 p.shell.send = lambda line: True  # no daemon in test
 p._subs = {}
 p.pending_idx = None
 p.click_note, p.click_cc = 0, 0
+p.pad_channel = 9
+p.click_single_ms, p.click_double_ms, p.click_long_ms = 350, 400, 800
+p.mode, p.menu_open, p.menu_idx = "instruments", False, 0
+p.favs = []
+p._press = None
+p._last_click_t = 0.0
+p._menu_saved = None
 p.confirm_on_note = True
 p.pv_enabled, p.pv_note, p.pv_vel, p.pv_ms = True, 72, 70, 250
 p.ding_enabled, p.ding_note, p.ding_vel, p.ding_ms = True, 84, 40, 150
@@ -185,13 +195,15 @@ check("handle.fx.consume",
       p2.handle(mido.Message("control_change", control=71, value=90)) is True
       and p2.fx_val["reverb"] == 90 and p2.idx == n_before)
 
-# 8. sub-bass layer injection
+# 8. bass booster layers (0-200%, second octave past 100%)
 p3 = Player.__new__(Player)
 for k, v in vars(p).items():
     setattr(p3, k, v)
 p3.fs_out = FakeOut()
 p3._subs = {}
-p3.fx_val = dict(p3.fx_val, bass=127)
+check("bass.pct.100", fx_pct(127) == 100 and fx_pct(254) == 200)
+check("bass.acc.top", fx_accumulate(0, 127, "absolute", 254) == 254)
+p3.fx_val = dict(p3.fx_val, bass=127)  # 100% = one octave, full vel
 on = mido.Message("note_on", channel=0, note=60, velocity=100)
 check("bass.note.fwd", p3.handle(on) is False)
 ex = p3.extra_for(on)
@@ -201,11 +213,26 @@ off = mido.Message("note_off", channel=0, note=60)
 ex2 = p3.extra_for(off)
 check("bass.sub.released", len(ex2) == 1 and ex2[0].note == 48
       and ex2[0].type == "note_off", ex2)
+p3.fx_val["bass"] = 254  # 200% = two octaves
+ex3 = p3.extra_for(mido.Message("note_on", channel=0, note=60, velocity=100))
+check("bass.boost.2oct", [m.note for m in ex3 if m.type == "note_on"] == [48, 36]
+      and ex3[0].velocity == 100 and ex3[1].velocity == 80,
+      [(m.type, m.note, m.velocity) for m in ex3])
+ex4 = p3.extra_for(mido.Message("note_off", channel=0, note=60))
+check("bass.boost.release", sorted(m.note for m in ex4) == [36, 48]
+      and all(m.type == "note_off" for m in ex4), ex4)
 p3.fx_val["bass"] = 0
 check("bass.off.quiet", p3.extra_for(
     mido.Message("note_on", channel=0, note=60, velocity=100)) == [])
 check("bass.low.skip", p3.extra_for(
     mido.Message("note_on", channel=0, note=5, velocity=100)) == [])
+# non-note messages must pass through untouched (no AttributeError)
+for m in (mido.Message("control_change", control=64, value=127),
+          mido.Message("pitchwheel", pitch=8000),
+          mido.Message("sysex", data=[1, 2, 3]),
+          mido.Message("aftertouch", value=40),
+          mido.Message("polytouch", note=60, value=40)):
+    check(f"extra.passthrough.{m.type}", p3.extra_for(m) == [], m)
 
 # 9. encoder browsing = highlight only; click/note confirms + loads
 p5 = Player.__new__(Player)
@@ -216,6 +243,9 @@ p5._load_q = _queue.Queue(maxsize=8)
 p5.idx = 4
 p5.pending_idx = None
 p5.click_note = 55
+p5.mode, p5.menu_open, p5.menu_idx, p5.favs = "instruments", False, 0, []
+p5._press, p5._last_click_t, p5._menu_saved = None, 0.0, None
+p5.click_single_ms, p5.click_double_ms, p5.click_long_ms = 350, 400, 800
 check("enc.rel.up", p5.handle(mido.Message("control_change", control=28, value=66)) is True
       and p5.pending_idx == 5 and p5.idx == 4 and p5._load_q.qsize() == 0,
       (p5.pending_idx, p5.idx))
@@ -230,10 +260,13 @@ for _ in range(20):
     p5.handle(mido.Message("control_change", control=28, value=66))
 check("enc.spin", p5.pending_idx == (6 + 20) % 8 and p5.idx == 4
       and p5._load_q.qsize() == 0, (p5.pending_idx, p5.idx))
-# click confirms: idx jumps, load queued
-check("enc.click", p5.handle(mido.Message("note_on", note=55, velocity=100)) is True
+# click = press then release: confirms, idx jumps, load queued
+check("click.press", p5.handle(mido.Message("note_on", note=55, velocity=100)) is True
+      and p5._press is not None and p5._load_q.qsize() == 0)
+check("click.release", p5.handle(mido.Message("note_off", note=55)) is True
       and p5.idx == (6 + 20) % 8 and p5.pending_idx is None
-      and p5._load_q.qsize() == 1, (p5.idx, p5.pending_idx))
+      and p5._press is None and p5._load_q.qsize() == 1,
+      (p5.idx, p5.pending_idx))
 item = p5._load_q.get_nowait()
 check("enc.click.item", item == (2, "x", 0, 2), item)
 # keys audition the highlight when enabled...
@@ -248,6 +281,146 @@ check("key.noconfirm", p5.handle(mido.Message("note_on", channel=0, note=60, vel
 # pads always load directly and clear the highlight
 check("pad.clears", p5.handle(mido.Message("note_on", note=37, velocity=100)) is True
       and p5.idx == 0 and p5.pending_idx is None, (p5.idx, p5.pending_idx))
+
+# 9b. encoder menu: double-click opens, turn moves, click enters, Esc closes
+p6 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p6, k, v)
+p6.fs_out = FakeOut()
+p6._load_q = _queue.Queue(maxsize=8)
+p6.idx, p6.pending_idx = 3, None
+p6.click_note, p6.click_cc = 55, 0
+p6.mode, p6.menu_open, p6.menu_idx, p6.favs = "instruments", False, 0, []
+p6._press, p6._last_click_t, p6._menu_saved = None, 0.0, None
+p6.click_single_ms, p6.click_double_ms, p6.click_long_ms = 350, 400, 800
+keys = [k for k, _, _ in MODES]
+
+
+def click(pl, note=55):
+    """One deliberate encoder click: press + release, well clear of the
+    previous click so it is not read as a double."""
+    pl._last_click_t = 0.0
+    pl.handle(mido.Message("note_on", note=note, velocity=100))
+    pl.handle(mido.Message("note_off", note=note))
+
+
+def dblclick(pl, note=55):
+    """Two clicks inside click_double_ms -> menu toggle."""
+    pl._last_click_t = 0.0
+    pl.handle(mido.Message("note_on", note=note, velocity=100))
+    pl.handle(mido.Message("note_off", note=note))
+    pl.handle(mido.Message("note_on", note=note, velocity=100))
+    pl.handle(mido.Message("note_off", note=note))
+
+
+click(p6)
+check("menu.firstclick.load", not p6.menu_open and p6.idx == 3, (p6.menu_open, p6.idx))
+dblclick(p6)
+check("menu.double.opens", p6.menu_open and p6.mode == "instruments", p6.menu_open)
+p6.handle(mido.Message("control_change", control=28, value=66))
+check("menu.scroll", p6.menu_idx == 1 and keys[p6.menu_idx] == "soundfonts", p6.menu_idx)
+p6.handle(mido.Message("control_change", control=28, value=66))
+p6.handle(mido.Message("control_change", control=28, value=66))
+p6.handle(mido.Message("control_change", control=28, value=66))
+check("menu.scroll2", keys[p6.menu_idx] == "volume", keys[p6.menu_idx])
+# browsing while the menu is open must not move the preset highlight
+before = p6.pending_idx
+check("menu.no.load", p6.pending_idx == before and p6.idx == 3
+      and p6._load_q.qsize() == 0, (p6.pending_idx, p6.idx))
+# press+release selects the highlighted mode
+click(p6)
+check("menu.enter.volume", not p6.menu_open and p6.mode == "volume"
+      and p6.menu_idx == keys.index("volume"), (p6.mode, p6.menu_idx))
+# in volume mode the encoder is the fader
+p6.vol_cc, p6.vol_backend = 14, "fluid"
+seen_gain = []
+p6.shell.send = lambda line: seen_gain.append(line) or True
+p6._vol_last_pct, p6._vol_last_t, p6.vol_cooldown = -1, 0.0, 0.0
+p6.ding_enabled = False
+p6.handle(mido.Message("control_change", control=28, value=127))
+check("menu.volume.knob", any("synth.gain" in g for g in seen_gain), seen_gain)
+check("menu.volume.nobrowse", p6._load_q.qsize() == 0)
+# the menu reopens on the current mode, wraps around, and 'close' restores it
+dblclick(p6)
+check("menu.reopen.atmode", p6.menu_open and keys[p6.menu_idx] == "volume",
+      (p6.menu_open, keys[p6.menu_idx]))
+p6.handle(mido.Message("control_change", control=28, value=66))
+check("menu.scroll.close", keys[p6.menu_idx] == "close", keys[p6.menu_idx])
+click(p6)
+# 'close' is a pure escape hatch: it returns to whatever mode you were in
+check("menu.close.restores", not p6.menu_open and p6.mode == "volume", p6.mode)
+p6.mode = "instruments"
+p6._sync_highlight()
+
+# 9c. favourites: long press stars, favourites mode only walks starred presets
+p7 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p7, k, v)
+p7.fs_out = FakeOut()
+p7._load_q = _queue.Queue(maxsize=8)
+p7.idx, p7.pending_idx = 2, None
+p7.click_note, p7.click_cc = 55, 0
+p7.mode, p7.menu_open, p7.menu_idx, p7.favs = "instruments", False, 0, []
+p7._press, p7._last_click_t, p7._menu_saved = None, 0.0, None
+p7.click_single_ms, p7.click_double_ms, p7.click_long_ms = 350, 400, 800
+check("fav.key", fav_key(p7.lib[2]) == "x|0|2", fav_key(p7.lib[2]))
+p7._browse_to(5)
+p7.handle(mido.Message("note_on", note=55, velocity=100))
+p7._press["t"] -= 2.0  # held past click_long_ms
+p7._click_tick()
+check("fav.longpress", p7.favs == [5] and p7._press is None, p7.favs)
+p7._press = None
+p7._click_tick()
+check("fav.once", p7.favs == [5], p7.favs)
+p7._press = None
+p7._press = {"t": time.time() - 2.0, "long": False}
+p7._click_tick()
+check("fav.longpress.off", p7.favs == [], p7.favs)
+# a quick click must not toggle a favourite
+p7._browse_to(6)
+click(p7)
+check("fav.short.safe", p7.favs == [] and p7._load_q.qsize() == 1, p7.favs)
+while not p7._load_q.empty():  # drain so the next count is exact
+    p7._load_q.get_nowait()
+# favourites mode browses only the starred list
+p7.favs = [1, 4, 6]
+p7.mode = "favorites"
+p7._sync_highlight()
+check("fav.view", p7.view() == [1, 4, 6] and p7.pending_idx == 6,
+      (p7.view(), p7.pending_idx))
+p7._browse_step(1)
+check("fav.view.step", p7.pending_idx == 1, p7.pending_idx)
+p7._browse_step(2)
+check("fav.view.wrap", p7.pending_idx == 6, p7.pending_idx)
+p7._browse_absolute(0)
+check("fav.view.abs", p7.pending_idx == 1, p7.pending_idx)
+# an unstarred current preset lands the highlight on the first starred one
+p7.idx = 2
+p7._sync_highlight()
+check("fav.view.fallback", p7.pending_idx == 1, p7.pending_idx)
+# picking a soundfont in soundfonts mode jumps there and leaves that mode
+for i, pr in enumerate(p7.lib):
+    pr["file"] = "a.sf2" if i < 5 else "b.sf2"
+    pr["sfont"] = 1 if i < 5 else 2
+p7.mode = "soundfonts"
+p7.idx = 2
+p7._sync_highlight()
+check("sf.view", p7.view() == [0, 5], p7.view())
+p7._browse_to(5)
+click(p7)
+check("sf.jump", p7.idx == 5 and p7.mode == "instruments"
+      and p7._load_q.qsize() == 1, (p7.idx, p7.mode))
+# state round-trip: favourites survive a restart, keyed by name not index
+p8 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p8, k, v)
+p8.favs = [1, 4, 6]
+keys_saved = [fav_key(p8.lib[i]) for i in p8.favs]
+p8.favs = []
+p8._restore_favs(keys_saved)
+check("fav.roundtrip", p8.favs == [1, 4, 6], p8.favs)
+p8._restore_favs(["nope.sf2|1|2"])
+check("fav.roundtrip.miss", p8.favs == [], p8.favs)
 
 # 10. shell effect command formatting
 seen = []
