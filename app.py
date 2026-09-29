@@ -1045,9 +1045,12 @@ class Player:
                     time.sleep(3)
                     if self.proc is not None and self.proc.poll() is not None:
                         fails += 1
-                        print(f"fluidsynth died on start "
-                              f"({self._fluid_log_tail()}). Retrying...",
-                              flush=True)
+                        tail = self._fluid_log_tail()
+                        hint = (" stale fluidsynth holding port 9800/audio? "
+                                "kill it: pkill -f 'fluidsynth -is'."
+                                if "error 98" in tail else "")
+                        print(f"fluidsynth died on start ({tail}).{hint} "
+                              "Retrying...", flush=True)
                         continue
                     fails = 0
                     self._reset_dyn()
