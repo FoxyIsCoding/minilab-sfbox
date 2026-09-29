@@ -89,9 +89,25 @@ Power on → ~20 s → first preset auto-loads → play. Watch with `sudo journa
 | Input | Default | Action |
 |---|---|---|
 | Preset knob | CC 16 | Browse all presets (absolute position, or endless in `relative2` mode) |
+| Display encoder | CC 28 | Browse all presets (relative steps, instant display, background load) |
 | Pad 1 / Pad 2 | notes 36 / 37 | Previous / next instrument |
+| Pad 7 / Pad 8 | notes 42 / 43 | Jump to first preset of prev / next **soundfont file** |
 | Program Change (ch 1) | — | Direct select inside current SoundFont (configure pads to ProgChg in MCC for 1-tap favorites) |
+| Fader 1 | CC 14 | Loudness: synth master gain 0–125% |
+| Fader 4 | CC 31 | Stereo pan (MIDI CC10) |
+| Knobs 1–8 | CC 86…117 | Reverb, Room, Damp, Chorus, Bass (sub-octave), Bright, Attack, Release |
 | Everything else | — | Forwarded to fluidsynth (keys, sustain CC64, pitchbend, modwheel…) |
+
+Switching soundfonts: all `.sf2` files form one long preset list, so the
+encoder and pads 1/2 cross file boundaries automatically; pads 7/8 jump
+straight to the next file. The display always shows which file you're in
+(`sf` line + `i/N name`).
+
+Volume note: the fader drives fluidsynth's master gain (`backend = fluid`,
+0–125%), not the Pi's hardware mixer — the Pi's onboard control is named
+`Headphone`, not `Master`, which is why mixer-based volume silently did
+nothing. Set `backend = amixer` + the right `control` if you prefer OS-level
+volume (capped at 100%).
 
 Display shows `SoundFont  i/N  PresetName` (scroll view for large lists, knob graphic for ≤128 presets). Last preset is remembered across reboots (`state.json`).
 

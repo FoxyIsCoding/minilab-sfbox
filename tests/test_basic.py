@@ -114,6 +114,7 @@ p.fluid = fluidmod.FluidControl()
 p.fluid.select = lambda *a, **k: True  # no daemon in test
 p._save_state = lambda: None
 p.knob_mode, p.preset_cc, p.prev_note, p.next_note, p.midi_ch = "absolute", 16, 36, 37, 0
+p.sf_prev_note, p.sf_next_note = 42, 43
 p.display_mode = "daw"
 p.encoder_cc, p.encoder_mode = 28, "auto"
 import queue as _queue
@@ -240,6 +241,42 @@ p6.inport, p6.fs_out, p6.ml_out = FakePort(), None, FakePort()
 p6._close_ports()
 check("close.ports", p6.inport is None and p6.fs_out is None
       and p6.ml_out is None)
+
+# 12. volume fader -> fluid gain 0..125%, soundfont jump pads
+p7 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p7, k, v)
+p7.fs_out = FakeOut()
+p7._load_q = _queue.Queue(maxsize=8)
+p7.vol_backend = "fluid"
+p7.vol_cooldown, p7._vol_last_pct, p7._vol_last_t = 0.0, -1, 0.0
+gsent = []
+p7.shell = fluidmod2.FluidShell()
+p7.shell.send = lambda line: gsent.append(line) or True
+check("vol.fluid.consume",
+      p7.handle(mido.Message("control_change", control=30, value=127)) is True
+      and gsent == ["set synth.gain 1.250"], gsent)
+gsent.clear()
+check("vol.fluid.mid",
+      p7.handle(mido.Message("control_change", control=30, value=64)) is True
+      and gsent == ["set synth.gain 0.630"], gsent)
+
+p8 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p8, k, v)
+p8.fs_out = FakeOut()
+p8._load_q = _queue.Queue(maxsize=8)
+p8.lib = ([{"sfont": 1, "file": "a.sf2", "bank": 0, "prog": i,
+            "sf": "a", "name": f"A{i}"} for i in range(3)] +
+          [{"sfont": 2, "file": "b.sf2", "bank": 0, "prog": i,
+            "sf": "b", "name": f"B{i}"} for i in range(2)])
+p8.idx = 1
+check("sf.next", p8.handle(mido.Message("note_on", note=43, velocity=100)) is True
+      and p8.idx == 3 and p8.lib[p8.idx]["sf"] == "b", p8.idx)
+check("sf.next.wrap", p8.handle(mido.Message("note_on", note=43, velocity=100)) is True
+      and p8.idx == 0, p8.idx)
+check("sf.prev", p8.handle(mido.Message("note_on", note=42, velocity=100)) is True
+      and p8.idx == 3, p8.idx)
 
 print(f"\n{len(fails)} failure(s): {fails}" if fails else "\nALL TESTS PASSED")
 sys.exit(1 if fails else 0)

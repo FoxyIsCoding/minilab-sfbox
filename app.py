@@ -274,6 +274,9 @@ class Player:
                                     "auto").strip().lower()
         self.prev_note = int(cfg_get(config, "controls", "prev_note", "36"))
         self.next_note = int(cfg_get(config, "controls", "next_note", "37"))
+        # pads 7/8 jump between soundfont files (notes are 0-based MIDI numbers)
+        self.sf_prev_note = int(cfg_get(config, "controls", "sf_prev_note", "42"))
+        self.sf_next_note = int(cfg_get(config, "controls", "sf_next_note", "43"))
         self.midi_ch = int(cfg_get(config, "controls", "midi_channel", "0"))
         self.display_mode = cfg_get(config, "display", "mode", "daw").strip().lower()
 
@@ -458,19 +461,25 @@ class Player:
     # -- volume / pan / fx actions (all consumed, not forwarded) --
     def _do_volume(self, v127: int):
         import subprocess as _sp
-        pct = round(v127 / 127 * 100)
+        pct = round(v127 / 127 * 125)  # 0..125%
         now = time.time()
         if pct != self._vol_last_pct and now - self._vol_last_t >= self.vol_cooldown:
-            cmd = build_volume_cmd(pct, self.vol_backend,
-                                   self.vol_card, self.vol_control)
-            if cmd:
-                try:
-                    _sp.run(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                            timeout=2)
-                except Exception as e:
-                    print(f"volume backend failed: {e}", flush=True)
+            backend = self.vol_backend
+            if backend == "auto":
+                backend = "fluid"  # always available, no mixer-name guessing
+            if backend == "fluid":
+                self.shell.send(f"set synth.gain {pct / 100:.3f}")
             else:
-                print("volume: no amixer/pactl found", flush=True)
+                cmd = build_volume_cmd(min(pct, 100), backend,
+                                       self.vol_card, self.vol_control)
+                if cmd:
+                    try:
+                        _sp.run(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                                timeout=2)
+                    except Exception as e:
+                        print(f"volume backend failed: {e}", flush=True)
+                else:
+                    print("volume: no amixer/pactl found", flush=True)
             self._vol_last_pct = pct
             self._vol_last_t = now
         self.popup("Volume", f"{pct}%", v127)
@@ -554,6 +563,23 @@ class Player:
         if not self.lib:
             return
         self.apply((self.idx + delta) % len(self.lib), quiet=quiet)
+
+    def step_soundfont(self, direction: int):
+        """Jump to the first preset of the prev/next soundfont file."""
+        if not self.lib:
+            return
+        cur_sf = self.lib[self.idx]["sfont"]
+        sfonts = sorted({p["sfont"] for p in self.lib})
+        if len(sfonts) < 2:
+            self.popup("SoundFont", self.lib[self.idx]["sf"],
+                       int(self.idx / max(1, len(self.lib)) * 127))
+            return
+        target = sfonts[(sfonts.index(cur_sf) + direction) % len(sfonts)]
+        for j, p in enumerate(self.lib):
+            if p["sfont"] == target:
+                print(f"soundfont -> {p['file']}", flush=True)
+                self.apply(j)
+                return
 
     def _browse_encoder(self, v: int):
         """Main encoder below the display: relative steps or absolute map."""
@@ -661,6 +687,12 @@ class Player:
                     return True
                 if msg.note == self.next_note:
                     self.step(1)
+                    return True
+                if msg.note == self.sf_prev_note:
+                    self.step_soundfont(-1)
+                    return True
+                if msg.note == self.sf_next_note:
+                    self.step_soundfont(1)
                     return True
             return False
         return False
