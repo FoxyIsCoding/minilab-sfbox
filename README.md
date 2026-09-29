@@ -89,7 +89,9 @@ Power on → ~20 s → first preset auto-loads → play. Watch with `sudo journa
 | Input | Default | Action |
 |---|---|---|
 | Display encoder | CC 28 | **Browse**: moves a `>` highlight on the display, sound unchanged |
-| Encoder click | — (discover yours, see below) | **Confirm**: loads the highlighted instrument + audition blip |
+| Click | Pad 3 (note 38) until you map yours | **Confirm**: loads the highlighted instrument + audition blip |
+| Double-click | — | Opens the **menu** on the display (modes, see below) |
+| Long press (~0.8 s) | — | **Favourites** the highlighted instrument (`*` on the display) |
 | Preset knob | CC 16 | Browse (highlight; click loads) |
 | Any piano key | — | Auditions the highlight (loads it first, `confirm.on_note`) |
 | Pad 1 / Pad 2 | notes 36 / 37 | Previous / next instrument (loads immediately) |
@@ -97,12 +99,40 @@ Power on → ~20 s → first preset auto-loads → play. Watch with `sudo journa
 | Program Change (ch 1) | — | Direct select inside current SoundFont (configure pads to ProgChg in MCC for 1-tap favorites) |
 | Fader 1 | CC 14 | Loudness: synth master gain 0–125% (+ subtle test ding when you stop moving) |
 | Fader 4 | CC 31 | Stereo pan (MIDI CC10) |
-| Knobs 1–8 | CC 86…117 | Reverb, Room, Damp, Chorus, Bass (sub-octave), Bright, Attack, Release |
+| Knobs 1–8 | CC 86…117 | Reverb, Room, Damp, Chorus, **BassBoost 0–200%**, Bright, Attack, Release |
 | Everything else | — | Forwarded to fluidsynth (keys, sustain CC64, pitchbend, modwheel…) |
 
-Finding your encoder-click message: `python3 tools/sniff.py 30`, click the
-encoder a few times, then set `encoder_click_note` (or `encoder_click_cc`)
-in `config.ini` to what you see.
+### Display menu (double-click)
+
+Double-click the click control to open an interactive list on the display,
+turn to highlight an entry, click to enter it:
+
+| Entry | What it does |
+|---|---|
+| `1 Instruments` | browse every preset (default) |
+| `2 SoundFonts` | browse whole `.sf2` files, click one to jump straight to it |
+| `3 Favorites` | browse only the presets you starred |
+| `4 * Star` | favourite / unfavourite the current one (same as a long press) |
+| `5 Master Vol` | the encoder becomes the loudness fader (0–125% + test ding) |
+| `6 Close` | back to whatever mode you were in |
+
+Favourites are saved in `state.json` and marked `*` in the preset list, so
+they survive a reboot.
+
+### Bass booster (0–200%)
+
+Knob 5 (`cc_bass`) is a real booster, not a 0–100 knob: `top_bass = 254` means
+the top half of its travel is **over 100%**. Under 100% it fades in one
+sub-octave (−12); past 100% it stacks a second, deeper layer (−24) up to 200%.
+Set `top_bass = 127` in `config.ini` if you want a plain 0–100 knob.
+
+### Mapping your real encoder click
+
+Until `encoder_click_note`/`encoder_click_cc` is set, **pad 3 (note 38)**
+stands in for the encoder push, so click / double-click / long-press all
+already work. To map the real thing: `python3 tools/sniff.py 30`, click the
+encoder a few times, then set `encoder_click_note` (or `encoder_click_cc`) in
+`config.ini` to what you see.
 
 Switching soundfonts: all `.sf2` files form one long preset list, so the
 encoder and pads 1/2 cross file boundaries automatically; pads 7/8 jump
