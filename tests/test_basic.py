@@ -245,6 +245,7 @@ p5.pending_idx = None
 p5.click_note = 55
 p5.mode, p5.menu_open, p5.menu_idx, p5.favs = "instruments", False, 0, []
 p5._press, p5._last_click_t, p5._menu_saved = None, 0.0, None
+p5._double_until = 0.0
 p5.click_single_ms, p5.click_double_ms, p5.click_long_ms = 350, 400, 800
 check("enc.rel.up", p5.handle(mido.Message("control_change", control=28, value=66)) is True
       and p5.pending_idx == 5 and p5.idx == 4 and p5._load_q.qsize() == 0,
@@ -292,14 +293,16 @@ p6.idx, p6.pending_idx = 3, None
 p6.click_note, p6.click_cc = 55, 0
 p6.mode, p6.menu_open, p6.menu_idx, p6.favs = "instruments", False, 0, []
 p6._press, p6._last_click_t, p6._menu_saved = None, 0.0, None
+p6._double_until = 0.0
 p6.click_single_ms, p6.click_double_ms, p6.click_long_ms = 350, 400, 800
 keys = [k for k, _, _ in MODES]
 
 
 def click(pl, note=55):
-    """One deliberate encoder click: press + release, well clear of the
-    previous click so it is not read as a double."""
+    """One deliberate encoder click: press + release, well clear of any
+    previous gesture so it is not read as part of a double-click."""
     pl._last_click_t = 0.0
+    pl._double_until = 0.0
     pl.handle(mido.Message("note_on", note=note, velocity=100))
     pl.handle(mido.Message("note_off", note=note))
 
@@ -307,6 +310,7 @@ def click(pl, note=55):
 def dblclick(pl, note=55):
     """Two clicks inside click_double_ms -> menu toggle."""
     pl._last_click_t = 0.0
+    pl._double_until = 0.0
     pl.handle(mido.Message("note_on", note=note, velocity=100))
     pl.handle(mido.Message("note_off", note=note))
     pl.handle(mido.Message("note_on", note=note, velocity=100))
@@ -352,6 +356,58 @@ check("menu.close.restores", not p6.menu_open and p6.mode == "volume", p6.mode)
 p6.mode = "instruments"
 p6._sync_highlight()
 
+# 9b2. the real MiniLab encoder press: CC 118, 127 down / 0 up
+p6.click_note, p6.click_cc = 0, 118
+p6.idx, p6.pending_idx, p6.favs = 3, 3, []
+p6._last_click_t = 0.0  # nothing in flight from the previous block
+while not p6._load_q.empty():
+    p6._load_q.get_nowait()
+down = mido.Message("control_change", control=118, value=127)
+up = mido.Message("control_change", control=118, value=0)
+check("cc118.down.consumed", p6.handle(down) is True and p6._press is not None)
+check("cc118.hold.nofire", p6._click_tick() is None and p6.favs == [])
+check("cc118.up.confirms", p6.handle(up) is True and p6._press is None
+      and p6._load_q.qsize() == 1 and not p6.menu_open, p6._load_q.qsize())
+while not p6._load_q.empty():
+    p6._load_q.get_nowait()
+# two quick presses = the menu (the trailing release must not re-trigger)
+p6._double_until = 0.0
+p6.handle(down)
+p6.handle(up)
+p6.handle(down)
+p6.handle(up)
+check("cc118.double.menu", p6.menu_open, p6.menu_open)
+# the 4-message double must not leave a phantom press behind, or the next
+# real click would be read as a double
+check("cc118.double.nopress", p6._press is None, p6._press)
+# a second press inside the window (press not yet released) also counts
+p6._double_until = 0.0
+p6.handle(down)
+p6.handle(down)
+check("cc118.double.overlap", not p6.menu_open, p6.menu_open)
+check("cc118.overlap.nopress", p6._press is None, p6._press)
+# ...and the click after that is a single click, not another double
+p6._double_until = 0.0
+p6.handle(down)
+p6.handle(up)
+check("cc118.after.double.is.single", p6._load_q.qsize() == 1
+      and not p6.menu_open, (p6._load_q.qsize(), p6.menu_open))
+while not p6._load_q.empty():
+    p6._load_q.get_nowait()
+# hold past click_long_ms = favourite, and the release must not also confirm
+p6._double_until = 0.0
+p6._browse_to(1)
+p6.handle(down)
+p6._press["t"] -= 2.0
+p6._click_tick()
+check("cc118.long.fav", p6.favs == [1] and p6._press is None, p6.favs)
+p6.handle(up)
+check("cc118.long.noconfirm", p6._load_q.qsize() == 0
+      and p6.favs == [1], (p6._load_q.qsize(), p6.favs))
+check("cc118.nofwd", p6.handle(mido.Message("control_change", control=118,
+                                           value=64)) is True)
+p6.click_cc = 0
+
 # 9c. favourites: long press stars, favourites mode only walks starred presets
 p7 = Player.__new__(Player)
 for k, v in vars(p).items():
@@ -362,6 +418,7 @@ p7.idx, p7.pending_idx = 2, None
 p7.click_note, p7.click_cc = 55, 0
 p7.mode, p7.menu_open, p7.menu_idx, p7.favs = "instruments", False, 0, []
 p7._press, p7._last_click_t, p7._menu_saved = None, 0.0, None
+p7._double_until = 0.0
 p7.click_single_ms, p7.click_double_ms, p7.click_long_ms = 350, 400, 800
 check("fav.key", fav_key(p7.lib[2]) == "x|0|2", fav_key(p7.lib[2]))
 p7._browse_to(5)

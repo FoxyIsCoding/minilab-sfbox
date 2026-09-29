@@ -338,12 +338,14 @@ class Player:
         self.encoder_cc = int(cfg_get(config, "controls", "encoder_cc", "0"))
         self.encoder_mode = cfg_get(config, "controls", "encoder_mode",
                                     "auto").strip().lower()
-        # The "click" control: the MiniLab 3's main encoder sends nothing when
-        # pressed (verified 2026-09-29: 5 presses, 1 hold, 1 double-press all
-        # produced zero MIDI), so a spare pad is the click by default.
-        # Units whose encoder *does* report a press can use click_cc instead.
-        self.click_note = int(cfg_get(config, "controls", "click_note", "38"))
-        self.click_cc = int(cfg_get(config, "controls", "click_cc", "0"))
+        # The "click" control. Discovered 2026-09-29 by sniffing + the
+        # MiniLab's own monitor: pressing the display encoder sends
+        # CC 118, value 127 on press and 0 on release. (CC 118 is normally
+        # "reset all controllers"; the MiniLab repurposes it, and we swallow
+        # it instead of letting it reset fluidsynth's controllers.)
+        # click_note is the note-number alternative for other mappings.
+        self.click_note = int(cfg_get(config, "controls", "click_note", "0"))
+        self.click_cc = int(cfg_get(config, "controls", "click_cc", "118"))
         # click timing (ms): single = confirm, double = menu, long = favourite
         self.click_single_ms = int(cfg_get(config, "controls", "click_single_ms", "350"))
         self.click_double_ms = int(cfg_get(config, "controls", "click_double_ms", "400"))
@@ -411,6 +413,7 @@ class Player:
         self.favs = []  # library indices, kept sorted + de-duplicated
         self._press = None      # pending click: {'t':..,'long':bool}
         self._last_click_t = 0.0
+        self._double_until = 0.0  # ignore releases trailing a double-click
         self._menu_hold_until = 0.0
         self._menu_saved = None  # (mode,) restored when leaving the menu
         # background preset loader: display updates instantly, synth loads async
@@ -747,6 +750,9 @@ class Player:
 
     def _double_click(self):
         self._last_click_t = 0.0
+        # a real double-click is 4 messages (down/up/down/up); swallow the
+        # trailing release so it is not read as a fresh click in the menu
+        self._double_until = time.time() + 0.3
         if self.menu_open:
             self._close_menu()
         else:
@@ -771,6 +777,11 @@ class Player:
 
     def _click_release(self):
         """Handle the release: single click unless a double/long already ran."""
+        if time.time() < self._double_until:
+            # trailing release of a double-click: swallow it *and* drop the
+            # press it belongs to, or the next real click reads as a double
+            self._press = None
+            return True
         p = self._press
         if p is None:
             return False
@@ -1267,7 +1278,7 @@ class Player:
                         self._browse_absolute(msg.value)
                 return True  # consume: don't send filter jumps to synth
             if self.click_cc and msg.control == self.click_cc:
-                # 127 = pressed, 0 = released (Arturia button convention)
+                # CC 118: 127 = encoder pressed, 0 = released
                 if msg.value >= 64:
                     self._click_press()
                 else:

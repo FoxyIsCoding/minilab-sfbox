@@ -89,7 +89,7 @@ Power on → ~20 s → first preset auto-loads → play. Watch with `sudo journa
 | Input | Default | Action |
 |---|---|---|
 | Display encoder | CC 28 | **Browse**: moves a `>` highlight on the display, sound unchanged |
-| Click | Pad 3 (note 38) | **Confirm**: loads the highlighted instrument + audition blip |
+| Click | Encoder (**CC 118**) | **Confirm**: loads the highlighted instrument + audition blip |
 | Double-tap | — | Opens the **menu** on the display (modes, see below) |
 | Long press (~0.8 s) | — | **Favourites** the highlighted instrument (`*` on the display) |
 | Preset knob | CC 16 | Browse (highlight; click loads) |
@@ -126,18 +126,17 @@ the top half of its travel is **over 100%**. Under 100% it fades in one
 sub-octave (−12); past 100% it stacks a second, deeper layer (−24) up to 200%.
 Set `top_bass = 127` in `config.ini` if you want a plain 0–100 knob.
 
-### Why a pad and not the encoder?
+### The click is CC 118
 
-The MiniLab 3's big encoder **sends no MIDI at all when you press it** —
-confirmed by sniffing 5 single presses, a 2-second hold and a fast
-double-press: zero note-ons, zero CCs, only the usual CC28 turns. So the
-`click` gestures are bound to **pad 3 (note 38)** instead, which does send a
-clean note-on/note-off pair.
+The MiniLab's display encoder has no press of its own in MIDI — pressing it
+sends **CC 118** (value 127 = down, 0 = up). CC 118 is normally "reset all
+controllers", so the app **swallows** it instead of letting it reset
+fluidsynth. A pad works too if you prefer: set `click_note` (e.g. 38 = pad 3;
+36/37 and 42/43 are already taken by prev/next preset and prev/next soundfont)
+and leave `click_cc = 0`. Set both to 0 to disable the click gestures.
 
-Change which pad does it with `click_note` in `config.ini` (36/37 and 42/43
-are taken by prev/next preset and prev/next soundfont, so 38–41 are free).
-On a unit whose encoder *does* report a press, set `click_cc` instead and the
-encoder takes over; `0` disables the click gestures entirely.
+Verified sniffer capture, 9 presses → 9 `127 → 0` pairs, including a 2.6 s
+hold for the long-press test.
 
 Switching soundfonts: all `.sf2` files form one long preset list, so the
 encoder and pads 1/2 cross file boundaries automatically; pads 7/8 jump
