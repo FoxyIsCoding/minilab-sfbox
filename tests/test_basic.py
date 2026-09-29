@@ -3,6 +3,7 @@
 
 import os
 import struct
+import time
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -129,10 +130,19 @@ p.fx_val = {k: 64 for k in p.fx_cc}
 p.shell = fluidmod2.FluidShell()
 p.shell.send = lambda line: True  # no daemon in test
 p._subs = {}
+p.pending_idx = None
+p.click_note, p.click_cc = 0, 0
+p.confirm_on_note = True
+p.pv_enabled, p.pv_note, p.pv_vel, p.pv_ms = True, 72, 70, 250
+p.ding_enabled, p.ding_note, p.ding_vel, p.ding_ms = True, 84, 40, 150
+p._pending_offs = []
+p._vol_ding_at, p._vol_ding_armed = 0.0, False
+# preset knob browses (highlight only, no load, no idx change)
 check("handle.knob.consume", p.handle(mido.Message("control_change", control=16, value=64)) is True)
-check("handle.knob.maps", p.idx == 4, p.idx)  # 64/128*8 = 4
-check("handle.next", p.handle(mido.Message("note_on", note=37, velocity=100)) is True and p.idx == 5)
-check("handle.prev", p.handle(mido.Message("note_on", note=36, velocity=100)) is True and p.idx == 4)
+check("handle.knob.pending", p.pending_idx == 4 and p.idx == 0
+      and p._load_q.qsize() == 0, (p.pending_idx, p.idx))  # 64/128*8 = 4
+check("handle.next", p.handle(mido.Message("note_on", note=37, velocity=100)) is True and p.idx == 1)
+check("handle.prev", p.handle(mido.Message("note_on", note=36, velocity=100)) is True and p.idx == 0)
 check("handle.note.fwd", p.handle(mido.Message("note_on", note=60, velocity=100)) is False)
 check("handle.cc.fwd", p.handle(mido.Message("control_change", control=64, value=127)) is False)
 check("handle.prog", p.handle(mido.Message("program_change", program=2)) is True and p.idx == 2)
@@ -197,25 +207,47 @@ check("bass.off.quiet", p3.extra_for(
 check("bass.low.skip", p3.extra_for(
     mido.Message("note_on", channel=0, note=5, velocity=100)) == [])
 
-# 9. main encoder browsing (relative binary-offset + absolute fallback)
+# 9. encoder browsing = highlight only; click/note confirms + loads
 p5 = Player.__new__(Player)
 for k, v in vars(p).items():
     setattr(p5, k, v)
 p5.fs_out = FakeOut()
 p5._load_q = _queue.Queue(maxsize=8)
 p5.idx = 4
+p5.pending_idx = None
+p5.click_note = 55
 check("enc.rel.up", p5.handle(mido.Message("control_change", control=28, value=66)) is True
-      and p5.idx == 5, p5.idx)
+      and p5.pending_idx == 5 and p5.idx == 4 and p5._load_q.qsize() == 0,
+      (p5.pending_idx, p5.idx))
 check("enc.rel.down", p5.handle(mido.Message("control_change", control=28, value=61)) is True
-      and p5.idx == 4, p5.idx)
+      and p5.pending_idx == 4, p5.pending_idx)
 check("enc.rel.center", p5.handle(mido.Message("control_change", control=28, value=64)) is True
-      and p5.idx == 4, p5.idx)
+      and p5.pending_idx == 4 and p5.idx == 4, p5.pending_idx)
 check("enc.abs", p5.handle(mido.Message("control_change", control=28, value=100)) is True
-      and p5.idx == 6, p5.idx)  # 100/128*8 = 6
-# rapid spin: every tick advances idx, queue coalesces pending loads
+      and p5.pending_idx == 6, p5.pending_idx)  # 100/128*8 = 6
+# rapid spin: highlight advances, sound untouched, nothing queued
 for _ in range(20):
     p5.handle(mido.Message("control_change", control=28, value=66))
-check("enc.spin", p5.idx == (6 + 20) % 8 and p5._load_q.qsize() <= 8, (p5.idx, p5._load_q.qsize()))
+check("enc.spin", p5.pending_idx == (6 + 20) % 8 and p5.idx == 4
+      and p5._load_q.qsize() == 0, (p5.pending_idx, p5.idx))
+# click confirms: idx jumps, load queued
+check("enc.click", p5.handle(mido.Message("note_on", note=55, velocity=100)) is True
+      and p5.idx == (6 + 20) % 8 and p5.pending_idx is None
+      and p5._load_q.qsize() == 1, (p5.idx, p5.pending_idx))
+item = p5._load_q.get_nowait()
+check("enc.click.item", item == (2, "x", 0, 2), item)
+# keys audition the highlight when enabled...
+p5._browse_to(7)
+check("key.confirm", p5.handle(mido.Message("note_on", channel=0, note=60, velocity=100)) is False
+      and p5.idx == 7 and p5.pending_idx is None, (p5.idx, p5.pending_idx))
+# ...but not when disabled
+p5.confirm_on_note = False
+p5._browse_to(3)
+check("key.noconfirm", p5.handle(mido.Message("note_on", channel=0, note=60, velocity=100)) is False
+      and p5.idx == 7 and p5.pending_idx == 3, (p5.idx, p5.pending_idx))
+# pads always load directly and clear the highlight
+check("pad.clears", p5.handle(mido.Message("note_on", note=37, velocity=100)) is True
+      and p5.idx == 0 and p5.pending_idx is None, (p5.idx, p5.pending_idx))
 
 # 10. shell effect command formatting
 seen = []
@@ -345,6 +377,35 @@ p9._load_q = _queue.Queue(maxsize=8)
 p9.apply(1)
 item = p9._load_q.get_nowait()
 check("enqueue.path", item == (1, big1_p, 0, 0), item)
+
+# 14. volume idle ding + audition blip plumbing
+p10 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p10, k, v)
+p10.fs_out = FakeOut()
+p10._load_q = _queue.Queue(maxsize=8)
+p10.vol_backend = "fluid"
+p10.vol_cooldown, p10._vol_last_pct, p10._vol_last_t = 0.0, -1, 0.0
+p10.shell = fluidmod2.FluidShell()
+p10.shell.send = lambda line: True
+p10.handle(mido.Message("control_change", control=30, value=100))
+check("ding.armed", p10._vol_ding_armed is True)
+p10._vol_ding_at = time.time() - 1.0  # idle long enough
+p10._housekeeping()
+ons = [m for m in p10.fs_out.sent if m.type == "note_on"]
+check("ding.fired", len(ons) == 1 and ons[0].note == 84
+      and ons[0].velocity == 40 and len(p10._pending_offs) == 1, ons)
+check("ding.once", (p10._housekeeping(), len(
+    [m for m in p10.fs_out.sent if m.type == "note_on"]))[1] == 1)
+p10._pending_offs = [(time.time() - 1.0, 0, 84)]  # release due
+p10._housekeeping()
+offs = [m for m in p10.fs_out.sent if m.type == "note_off"]
+check("ding.released", len(offs) == 1 and offs[0].note == 84
+      and p10._pending_offs == [], offs)
+fout = FakeOut()
+p10._preview_note(fout, 72, 70, 1)
+check("preview.blip", [m.type for m in fout.sent] == ["note_on", "note_off"]
+      and fout.sent[0].note == 72, [m.type for m in fout.sent])
 
 print(f"\n{len(fails)} failure(s): {fails}" if fails else "\nALL TESTS PASSED")
 sys.exit(1 if fails else 0)

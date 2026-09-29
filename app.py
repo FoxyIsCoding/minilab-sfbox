@@ -295,6 +295,22 @@ class Player:
         self.encoder_cc = int(cfg_get(config, "controls", "encoder_cc", "0"))
         self.encoder_mode = cfg_get(config, "controls", "encoder_mode",
                                     "auto").strip().lower()
+        # encoder push-to-confirm (discovered per unit; 0 = disabled)
+        self.click_note = int(cfg_get(config, "controls", "encoder_click_note", "0"))
+        self.click_cc = int(cfg_get(config, "controls", "encoder_click_cc", "0"))
+        self.confirm_on_note = cfg_get(config, "confirm", "on_note",
+                                       "true").strip().lower() in ("1", "true", "yes", "on")
+        # audition blip after a preset loads + subtle ding for volume test
+        self.pv_enabled = cfg_get(config, "preview", "enabled",
+                                  "true").strip().lower() in ("1", "true", "yes", "on")
+        self.pv_note = int(cfg_get(config, "preview", "note", "72"))
+        self.pv_vel = int(cfg_get(config, "preview", "vel", "70"))
+        self.pv_ms = int(cfg_get(config, "preview", "ms", "250"))
+        self.ding_enabled = cfg_get(config, "preview", "ding",
+                                    "true").strip().lower() in ("1", "true", "yes", "on")
+        self.ding_note = int(cfg_get(config, "preview", "ding_note", "84"))
+        self.ding_vel = int(cfg_get(config, "preview", "ding_vel", "40"))
+        self.ding_ms = int(cfg_get(config, "preview", "ding_ms", "150"))
         self.prev_note = int(cfg_get(config, "controls", "prev_note", "36"))
         self.next_note = int(cfg_get(config, "controls", "next_note", "37"))
         # pads 7/8 jump between soundfont files (notes are 0-based MIDI numbers)
@@ -329,9 +345,14 @@ class Player:
         self.shell = fluidmod.FluidShell()
         self._subs = {}  # (channel, note) -> sub-bass note (app-side octave layer)
         # background preset loader: display updates instantly, synth loads async
+        # background preset loader: display updates instantly, synth loads async
         self._load_q = queue.Queue(maxsize=8)
         self._last_show = 0.0
         self._last_save = 0.0
+        self.pending_idx = None  # highlighted (not yet sounding) preset
+        self._pending_offs = []  # [(deadline, channel, note)] note-offs to send
+        self._vol_ding_at = 0.0  # last volume change (for idle ding)
+        self._vol_ding_armed = False
         # lazy soundfont loading: small files preload, big ones on demand
         try:
             preload_max = float(cfg_get(config, "library", "preload_max_mb", "8"))
@@ -514,6 +535,7 @@ class Player:
                       f"({waits}s)", flush=True)
             time.sleep(1)
         self.inport = mido.open_input(ml_in)
+        self._ml_in_name = ml_in
         # separate output handles: fluidsynth (notes) + minilab (sysex display)
         self.fs_out = mido.open_output(fs_names[0])
         try:
@@ -540,6 +562,7 @@ class Player:
         if idx is not None:
             self.idx = max(0, min(len(self.lib) - 1, idx))
         p = self.lib[self.idx]
+        self.pending_idx = None  # a direct load always clears the highlight
         now = time.time()
         if not quiet or now - self._last_show >= 0.03:
             self.show(p)
@@ -568,6 +591,28 @@ class Player:
                 q.put_nowait(item)
             except queue.Full:
                 pass
+
+    # -- click-to-confirm browsing --
+    def _browse_to(self, idx: int):
+        """Highlight a preset (display only). Sound changes on confirm."""
+        if not self.lib:
+            return
+        self.pending_idx = max(0, min(len(self.lib) - 1, idx))
+        now = time.time()
+        if now - self._last_show >= 0.03:  # keep fast spins fluid
+            p = self.lib[self.pending_idx]
+            self.show(p, pending=True)
+            self._last_show = now
+
+    def _confirm(self, via: str = ""):
+        """Load the highlighted preset (no-op when nothing pending)."""
+        if self.pending_idx is None or not self.lib:
+            return False
+        if via:
+            print(f"confirmed via {via}: ", flush=True, end="")
+        self.apply(self.pending_idx)
+        self.pending_idx = None
+        return True
 
     def _push_channel_ccs(self):
         """Re-send sticky per-channel CCs (tone + pan) on all channels."""
@@ -624,6 +669,40 @@ class Player:
             self._vol_last_pct = pct
             self._vol_last_t = now
         self.popup("Volume", f"{pct}%", v127)
+        if self.ding_enabled:
+            self._vol_ding_at = now
+            self._vol_ding_armed = True
+
+    def _blip(self, note: int, vel: int, ms: int):
+        """Play a short test note on the synth + schedule its release."""
+        if self.fs_out is None:
+            return
+        try:
+            self.fs_out.send(self.mido.Message(
+                "note_on", channel=0, note=note, velocity=vel))
+            self._pending_offs.append((time.time() + ms / 1000, 0, note))
+        except Exception:
+            pass
+
+    def _housekeeping(self):
+        """Called every poll-loop tick: releases, idle volume ding."""
+        now = time.time()
+        if self._pending_offs and self.fs_out is not None:
+            keep = []
+            for deadline, ch, note in self._pending_offs:
+                if deadline <= now:
+                    try:
+                        self.fs_out.send(self.mido.Message(
+                            "note_off", channel=ch, note=note, velocity=0))
+                    except Exception:
+                        pass
+                else:
+                    keep.append((deadline, ch, note))
+            self._pending_offs = keep
+        if (self._vol_ding_armed and self.ding_enabled
+                and now - self._vol_ding_at >= 0.35):
+            self._vol_ding_armed = False
+            self._blip(self.ding_note, self.ding_vel, self.ding_ms)
 
     def _do_pan(self, v127: int):
         self.pan = v127
@@ -677,20 +756,26 @@ class Player:
         except Exception:
             pass
 
-    def show(self, p):
+    def show(self, p, pending=False):
         total = len(self.lib)
         l1 = f"{p['sf']}"[:16]
-        l2 = f"{self.idx + 1}/{total} {p['name']}"[:28]
+        pi = getattr(self, "pending_idx", None)
+        pos = pi if (pending and pi is not None) else self.idx
+        if pending and pi is not None:
+            l2 = f"> {pi + 1}/{total} {p['name']}"[:28]
+        else:
+            l2 = f"{self.idx + 1}/{total} {p['name']}"[:28]
         print(f"[{self.idx + 1}/{total}] {p['sf']} | "
-              f"bank {p['bank']} prog {p['prog']} | {p['name']}", flush=True)
+              f"bank {p['bank']} prog {p['prog']} | {p['name']}" +
+              (" (browsing)" if pending else ""), flush=True)
         if self.ml_out is None:
             return
         try:
-            val = int(127 * (self.idx + 1) / max(1, total))
+            val = int(127 * (pos + 1) / max(1, total))
             self.ml_out.send(
                 self.mido.Message("sysex",
                                   data=list(disp.msg_init()[1:-1])))
-            msg = disp.msg_scroll(l1, l2, min(self.idx, 126),
+            msg = disp.msg_scroll(l1, l2, min(pos, 126),
                                   min(total, 127))
             # float knob graphic instead if single-soundfont GM set
             if total <= 128:
@@ -699,6 +784,18 @@ class Player:
                 self.mido.Message("sysex", data=list(msg[1:-1])))
         except Exception:
             pass
+
+    def _browse_step(self, delta: int):
+        """Encoder/knob browsing: move highlight, never load (click confirms)."""
+        if not self.lib:
+            return
+        base = self.pending_idx if self.pending_idx is not None else self.idx
+        self._browse_to((base + delta) % len(self.lib))
+
+    def _browse_absolute(self, v: int):
+        if not self.lib:
+            return
+        self._browse_to(int(v / 128 * len(self.lib)))
 
     def step(self, delta, quiet=False):
         if not self.lib:
@@ -723,24 +820,44 @@ class Player:
                 return
 
     def _browse_encoder(self, v: int):
-        """Main encoder below the display: relative steps or absolute map."""
+        """Main encoder below the display: highlight only, click loads."""
         if not self.lib:
             return
         m = self.encoder_mode
         if m == "absolute":
-            self.apply(int(v / 128 * len(self.lib)), quiet=True)
+            self._browse_absolute(v)
             return
         if m.startswith("rel"):
             d = rel2_delta(v)
             if d != 0:
-                self.step(1 if d > 0 else -1, quiet=True)
+                self._browse_step(1 if d > 0 else -1)
             return
         # auto: binary-offset relatives live at 60..68, anything else is absolute
         if 60 <= v <= 68:
             if v != 64:
-                self.step(1 if v > 64 else -1, quiet=True)
+                self._browse_step(1 if v > 64 else -1)
         else:
-            self.apply(int(v / 128 * len(self.lib)), quiet=True)
+            self._browse_absolute(v)
+
+    def _preview_note(self, port, note: int, vel: int, ms: int):
+        """Audition blip after a preset loads (worker thread)."""
+        try:
+            port.send(self.mido.Message(
+                "note_on", channel=0, note=note, velocity=vel))
+            time.sleep(max(0.05, ms / 1000))
+            port.send(self.mido.Message(
+                "note_off", channel=0, note=note, velocity=0))
+        except Exception:
+            pass
+
+    def _ensure_worker_port(self):
+        """Worker-local fluidsynth MIDI port (reopened if stale)."""
+        try:
+            names = [n for n in self.mido.get_output_names()
+                     if "fluid" in n.lower() or "synth" in n.lower()]
+            return self.mido.open_output(names[0]) if names else None
+        except Exception:
+            return None
 
     def _loader_loop(self):
         """Background: resolve path->sfont (loading big files on demand,
@@ -761,23 +878,33 @@ class Player:
                       flush=True)
                 continue
             if fluid.select(sid, bank, prog, retries=2):
-                continue
-            try:  # shell down: MIDI fallback on a worker-local port
+                loaded = True
+            else:
+                loaded = False
+                try:  # shell down: MIDI fallback on a worker-local port
+                    if fs is None:
+                        fs = self._ensure_worker_port()
+                    if fs is not None:
+                        fs.send(self.mido.Message(
+                            "control_change", channel=0, control=0,
+                            value=(bank >> 7) & 0x7F))
+                        fs.send(self.mido.Message(
+                            "control_change", channel=0, control=32,
+                            value=bank & 0x7F))
+                        fs.send(self.mido.Message(
+                            "program_change", channel=0, program=prog % 128))
+                        loaded = True
+                except Exception:
+                    fs = None  # stale port (synth respawned?) -> reopen next time
+            if loaded and self.pv_enabled:
                 if fs is None:
-                    names = [n for n in self.mido.get_output_names()
-                             if "fluid" in n.lower() or "synth" in n.lower()]
-                    fs = self.mido.open_output(names[0]) if names else None
+                    fs = self._ensure_worker_port()
                 if fs is not None:
-                    fs.send(self.mido.Message(
-                        "control_change", channel=0, control=0,
-                        value=(bank >> 7) & 0x7F))
-                    fs.send(self.mido.Message(
-                        "control_change", channel=0, control=32,
-                        value=bank & 0x7F))
-                    fs.send(self.mido.Message(
-                        "program_change", channel=0, program=prog % 128))
-            except Exception:
-                fs = None  # stale port (synth respawned?) -> reopen next time
+                    try:
+                        self._preview_note(fs, self.pv_note,
+                                           self.pv_vel, self.pv_ms)
+                    except Exception:
+                        fs = None
 
     # -- message handling: returns True if consumed (don't forward) --
     def handle(self, msg):
@@ -804,14 +931,18 @@ class Player:
                 self._browse_encoder(msg.value)
                 return True
             if msg.control == self.preset_cc:
+                # preset knob browses too (highlight; click loads)
                 if self.knob_mode.startswith("rel"):
                     d = rel2_delta(msg.value)
                     if d != 0:
-                        self.step(1 if d > 0 else -1)
+                        self._browse_step(1 if d > 0 else -1)
                 else:  # absolute: map 0..127 across library
                     if self.lib:
-                        self.apply(int(msg.value / 128 * len(self.lib)))
+                        self._browse_absolute(msg.value)
                 return True  # consume: don't send filter jumps to synth
+            if self.click_cc and msg.control == self.click_cc:
+                self._confirm("encoder click")
+                return True
             return False
         if t == "program_change":
             bank = (self.bank_msb << 7) | self.bank_lsb
@@ -829,6 +960,9 @@ class Player:
             return True
         if t in ("note_on", "note_off"):
             if t == "note_on" and msg.velocity > 0:
+                if self.click_note and msg.note == self.click_note:
+                    self._confirm("encoder click")
+                    return True
                 if msg.note == self.prev_note:
                     self.step(-1)
                     return True
@@ -841,6 +975,10 @@ class Player:
                 if msg.note == self.sf_next_note:
                     self.step_soundfont(1)
                     return True
+                # keys audition the highlight (loads it first) when enabled
+                if (self.pending_idx is not None and self.confirm_on_note
+                        and msg.channel == 0):
+                    self._confirm("key press")
             return False
         return False
 
@@ -923,30 +1061,50 @@ class Player:
                     loader_started = True
                 self.apply(self.idx)
                 self._warm_current()
-                print("Ready. Twist preset knob / pads to switch. "
+                self.popup("sfbox ready",
+                           f"{len(self.sf_files)}SF {len(self.lib)} presets")
+                print("Ready. Scroll to browse, click to load. "
                       "Ctrl-C to stop.", flush=True)
                 last_watch = time.time()
-                while True:  # poll loop doubles as synth watchdog
-                    msg = self.inport.poll()
-                    if msg is None:
-                        if time.time() - last_watch > 2:
-                            last_watch = time.time()
-                            if (self.proc is not None and
-                                    self.proc.poll() is not None):
-                                print("fluidsynth died during play "
-                                      f"({self._fluid_log_tail()}). "
-                                      "Respawning...", flush=True)
-                                break
-                        time.sleep(0.005)
-                        continue
+                last_enum = 0.0
+                while True:  # non-blocking poll: unplug-proof + watchdog
                     try:
-                        if not self.handle(msg):
-                            if self.fs_out:
-                                self.fs_out.send(msg)
-                                for extra in self.extra_for(msg):
-                                    self.fs_out.send(extra)
+                        pending = self.inport.iter_pending()
                     except Exception as e:
-                        print(f"midi error: {e}", flush=True)
+                        print(f"MIDI port failed ({e}), reconnecting...",
+                              flush=True)
+                        break
+                    for msg in pending:
+                        try:
+                            if not self.handle(msg):
+                                if self.fs_out:
+                                    self.fs_out.send(msg)
+                                    for extra in self.extra_for(msg):
+                                        self.fs_out.send(extra)
+                        except Exception as e:
+                            print(f"midi error: {e}", flush=True)
+                    self._housekeeping()
+                    now = time.time()
+                    if now - last_watch > 2:
+                        last_watch = now
+                        if (self.proc is not None and
+                                self.proc.poll() is not None):
+                            print("fluidsynth died during play "
+                                  f"({self._fluid_log_tail()}). "
+                                  "Respawning...", flush=True)
+                            break
+                    if now - last_enum > 2:
+                        last_enum = now
+                        try:
+                            present = (self._ml_in_name in
+                                       self.mido.get_input_names())
+                        except Exception:
+                            present = True
+                        if not present:
+                            print("MiniLab unplugged, waiting for replug...",
+                                  flush=True)
+                            break
+                    time.sleep(0.005)
                 print("reconnecting in 2s...", flush=True)
                 time.sleep(2)
             except RuntimeError as e:
