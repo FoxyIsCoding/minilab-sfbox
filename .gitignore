@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 state.json
+fluid.log
 soundfonts/*.sf2
 soundfonts/*.sf3
 soundfonts/*.SF2

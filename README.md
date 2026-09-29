@@ -113,7 +113,37 @@ Display shows `SoundFont  i/N  PresetName` (scroll view for large lists, knob gr
 
 ## Pi 2 latency notes
 
-Defaults are conservative for the Pi 2's Cortex-A7: 44.1 kHz, 64-voice polyphony, 64-sample ALSA periods. If you hear crackles: use the USB DAC (`audio_device = hw:Device`), keep to one modest-size SF2, don't raise polyphony. HDMI output stays on by default here (unlike some scripts) so a plugged monitor still works — disable it in `/boot/config.txt` if you need the last mA.
+Defaults are conservative for the Pi 2's Cortex-A7: 44.1 kHz, 64-voice polyphony, 128-sample periods. If you hear crackles: use the USB DAC (`audio_device = hw:Device`), keep to one modest-size SF2, don't raise polyphony. HDMI output stays on by default here (unlike some scripts) so a plugged monitor still works — disable it in `/boot/config.txt` if you need the last mA.
+
+## Big soundfont libraries (lazy loading)
+
+All `.sf2` files are parsed at boot (names only — instant), but only files
+under `[library] preload_max_mb` (default 8 MB) are loaded into RAM. Big
+files load **in the background the first time you select them** — the display
+shows the target preset instantly, sound follows in a few seconds — and stay
+cached until total background samples exceed `[library] mem_cap_mb`
+(default 256 MB, safe on a 1 GB Pi 2), when the least-recently-used file
+unloads automatically. First boot with 400 MB of samples takes seconds, not
+minutes, and RAM stays bounded.
+
+## Unplug-proofing
+
+Boot with nothing plugged in, yank the keyboard or the USB DAC mid-session —
+the app waits for MIDI ports, respawns fluidsynth if the audio device
+vanishes, and reconnects everything when devices return. No systemd
+crash-loop, no restart needed.
+
+## Wi-Fi on the Pi 2 (no onboard wireless)
+
+- Only needed for setup/uploads — the box plays fully offline.
+- **TL-WN821N: check the hardware version first** (`lsusb` on any Linux box).
+  v1–v3 (Atheros) work with `sudo apt install firmware-atheros`;
+  v4 (RTL8192CU) works out of the box but wants a powered hub;
+  **v5/v6 (RTL8192EU) have no mainline driver** — TP-Link's own driver only
+  supports kernels ≤4.9, so on current Pi OS you'd be compiling a community
+  DKMS driver on a Pi 2 (slow, breaks on kernel updates). Avoid.
+- Safest cheap options: RTL8188CUS / RTL8192CU nano dongles (in-kernel), or
+  phone USB tethering for the 5 minutes setup takes.
 
 ## Files
 

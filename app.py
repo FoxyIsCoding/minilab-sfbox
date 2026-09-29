@@ -243,6 +243,29 @@ FX_TITLES = {"reverb": "Reverb", "room": "RoomSize", "damp": "Damp",
              "attack": "Attack", "release": "Release"}
 
 
+def partition_files(files_sizes, preload_max_mb: float):
+    """Split [(path, bytes)] into (preload, lazy) by size threshold."""
+    preload, lazy = [], []
+    for path, size in files_sizes:
+        (preload if size <= preload_max_mb * 1024 * 1024 else lazy).append(path)
+    return preload, lazy
+
+
+def choose_evictions(loaded_order, current_path, cap_bytes: int):
+    """loaded_order: [(path, bytes)] oldest-first. Returns paths to drop
+    (never the current file) so the total fits cap_bytes."""
+    total = sum(s for _, s in loaded_order)
+    evict = []
+    for path, size in loaded_order:
+        if total <= cap_bytes:
+            break
+        if path == current_path:
+            continue
+        evict.append(path)
+        total -= size
+    return evict
+
+
 # ---------------- player ----------------
 
 class Player:
@@ -309,6 +332,29 @@ class Player:
         self._load_q = queue.Queue(maxsize=8)
         self._last_show = 0.0
         self._last_save = 0.0
+        # lazy soundfont loading: small files preload, big ones on demand
+        try:
+            preload_max = float(cfg_get(config, "library", "preload_max_mb", "8"))
+        except ValueError:
+            preload_max = 8.0
+        try:
+            self.mem_cap = int(cfg_get(config, "library", "mem_cap_mb", "256")) * 1024 * 1024
+        except ValueError:
+            self.mem_cap = 256 * 1024 * 1024
+        sizes = []
+        for f in self.sf_files:
+            try:
+                sizes.append((f, os.path.getsize(f)))
+            except OSError:
+                sizes.append((f, 0))
+        self.preload_files, self.lazy_files = partition_files(sizes, preload_max)
+        self.preload_ids = {}  # path -> sfont id (1-based cmdline order)
+        self.dyn_ids = {}      # path -> live-loaded sfont id
+        self.dyn_order = []    # paths oldest-first (LRU)
+        self.dyn_bytes = 0
+        self._font_lock = threading.Lock()
+        self._font_gen = 0     # bumped on synth respawn; stale loads discarded
+        self.fluid_log = os.path.join(HERE, "fluid.log")
 
     # -- state --
     def _load_state(self):
@@ -339,10 +385,101 @@ class Player:
             print("No .sf2/.sf3 in soundfonts/. "
                   "Drop one in and restart.", flush=True)
             return None
-        cmd = fluidmod.build_command(self.sf_files, audio, gain, sr, poly)
+        # only small files preload; big ones load on demand (fast boot, low RAM)
+        cmd = fluidmod.build_command(self.preload_files, audio, gain, sr, poly)
+        print(f"fluidsynth: preloading {len(self.preload_files)} file(s), "
+              f"{len(self.lazy_files)} lazy", flush=True)
         print("fluidsynth:", " ".join(cmd), flush=True)
-        self.proc = fluidmod.spawn(cmd)
+        self.preload_ids = {f: i + 1 for i, f in enumerate(self.preload_files)}
+        self.proc = fluidmod.spawn(cmd, log_path=getattr(self, "fluid_log", None))
         return self.proc
+
+    def _reap_fluid(self):
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def _fluid_log_tail(self, n=5):
+        try:
+            with open(getattr(self, "fluid_log", "/dev/null"), "rb") as f:
+                lines = f.read().splitlines()[-n:]
+            return "; ".join(l.decode(errors="replace")[:160] for l in lines)
+        except OSError:
+            return ""
+
+    # -- dynamic soundfont set (loader thread owns _resolve_font) --
+    def _resolve_font(self, path: str):
+        """Return live sfont id for path, background-loading + enforcing
+        the memory cap if needed. None on failure or stale generation."""
+        with self._font_lock:
+            if path in self.preload_ids:
+                return self.preload_ids[path]
+            if path in self.dyn_ids:
+                if path in self.dyn_order:
+                    self.dyn_order.remove(path)
+                self.dyn_order.append(path)
+                return self.dyn_ids[path]
+        gen = self._font_gen
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        print(f"loading {os.path.basename(path)} "
+              f"({size / 1048576:.0f}MB) in background...", flush=True)
+        sid = self.shell.load_font(path)
+        with self._font_lock:
+            if sid is None or gen != self._font_gen:
+                return None
+            self.dyn_ids[path] = sid
+            if path in self.dyn_order:
+                self.dyn_order.remove(path)
+            self.dyn_order.append(path)
+            self.dyn_bytes += size
+            cur = self.current()
+            cur_path = cur["file"] if cur else None
+            order = [(p, self._size_of(p)) for p in self.dyn_order]
+            for victim in choose_evictions(order, cur_path, self.mem_cap):
+                vid = self.dyn_ids.pop(victim, None)
+                if victim in self.dyn_order:
+                    self.dyn_order.remove(victim)
+                self.dyn_bytes = max(0, self.dyn_bytes - self._size_of(victim))
+                if vid is not None:
+                    print(f"unloading {os.path.basename(victim)} "
+                          f"(memory cap)", flush=True)
+                    self.shell.unload_font(vid)
+            return sid
+
+    def _size_of(self, path: str) -> int:
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def _reset_dyn(self):
+        with self._font_lock:
+            self.dyn_ids = {}
+            self.dyn_order = []
+            self.dyn_bytes = 0
+            self._font_gen += 1
+
+    def _warm_current(self):
+        """After (re)start, background-load the current file if not loaded."""
+        cur = self.current()
+        if cur is None:
+            return
+        with self._font_lock:
+            known = cur["file"] in self.preload_ids or cur["file"] in self.dyn_ids
+        if not known:
+            self._enqueue_load(self.idx, cur)
 
     # -- midi ports --
     def open_ports(self):
@@ -412,21 +549,25 @@ class Player:
             self._last_save = now
         if not quiet:
             self._push_channel_ccs()
+        self._enqueue_load(self.idx, p)
+
+    def _enqueue_load(self, idx: int, p: dict):
         q = getattr(self, "_load_q", None)
-        if q is not None:
-            item = (self.idx, p["sfont"], p["bank"], p["prog"])
+        if q is None:
+            return
+        item = (idx, p["file"], p["bank"], p["prog"])
+        try:
+            q.put_nowait(item)
+        except queue.Full:
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
             try:
                 q.put_nowait(item)
             except queue.Full:
-                try:
-                    while True:
-                        q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    q.put_nowait(item)
-                except queue.Full:
-                    pass
+                pass
 
     def _push_channel_ccs(self):
         """Re-send sticky per-channel CCs (tone + pan) on all channels."""
@@ -602,7 +743,8 @@ class Player:
             self.apply(int(v / 128 * len(self.lib)), quiet=True)
 
     def _loader_loop(self):
-        """Background: apply latest queued preset to the synth (coalesced)."""
+        """Background: resolve path->sfont (loading big files on demand,
+        coalesced to where the user landed) then select the preset."""
         fluid = fluidmod.FluidControl()
         fs = None
         while True:
@@ -612,8 +754,13 @@ class Player:
                     item = self._load_q.get_nowait()
             except queue.Empty:
                 pass
-            _, sfont, bank, prog = item
-            if fluid.select(sfont, bank, prog, retries=2):
+            _, path, bank, prog = item
+            sid = self._resolve_font(path)
+            if sid is None:
+                print(f"preset load failed for {os.path.basename(path)}",
+                      flush=True)
+                continue
+            if fluid.select(sid, bank, prog, retries=2):
                 continue
             try:  # shell down: MIDI fallback on a worker-local port
                 if fs is None:
@@ -630,7 +777,7 @@ class Player:
                     fs.send(self.mido.Message(
                         "program_change", channel=0, program=prog % 128))
             except Exception:
-                pass
+                fs = None  # stale port (synth respawned?) -> reopen next time
 
     # -- message handling: returns True if consumed (don't forward) --
     def handle(self, msg):
@@ -744,23 +891,54 @@ class Player:
                   flush=True)
             time.sleep(30)
             return
-        self.start_fluid()
-        time.sleep(3)
         loader_started = False
-        while True:  # survive unplug/replug without restarting fluidsynth
+        fails = 0
+        while True:  # survive unplug/replug + audio loss without systemd churn
             try:
+                # (re)start the synth if needed (unplugged DAC, boot w/o audio)
+                if self.proc is None or self.proc.poll() is not None:
+                    self._reap_fluid()
+                    if fails:
+                        time.sleep(min(30, 5 * fails))
+                    n_pre = len(getattr(self, "preload_files", self.sf_files))
+                    print(f"starting fluidsynth ({n_pre} file(s) preloaded)...",
+                          flush=True)
+                    self.start_fluid()
+                    time.sleep(3)
+                    if self.proc is not None and self.proc.poll() is not None:
+                        fails += 1
+                        print(f"fluidsynth died on start "
+                              f"({self._fluid_log_tail()}). Retrying...",
+                              flush=True)
+                        continue
+                    fails = 0
+                    self._reset_dyn()
                 self._close_ports()
                 self._subs = {}
-                self.open_ports()
+                self.open_ports()  # waits forever; raises only if synth died
                 self._sync_fx_from_synth()
                 if not loader_started:
                     threading.Thread(target=self._loader_loop,
                                      daemon=True).start()
                     loader_started = True
                 self.apply(self.idx)
+                self._warm_current()
                 print("Ready. Twist preset knob / pads to switch. "
                       "Ctrl-C to stop.", flush=True)
-                for msg in self.inport:
+                last_watch = time.time()
+                while True:  # poll loop doubles as synth watchdog
+                    msg = self.inport.poll()
+                    if msg is None:
+                        if time.time() - last_watch > 2:
+                            last_watch = time.time()
+                            if (self.proc is not None and
+                                    self.proc.poll() is not None):
+                                print("fluidsynth died during play "
+                                      f"({self._fluid_log_tail()}). "
+                                      "Respawning...", flush=True)
+                                break
+                        time.sleep(0.005)
+                        continue
                     try:
                         if not self.handle(msg):
                             if self.fs_out:
@@ -769,15 +947,13 @@ class Player:
                                     self.fs_out.send(extra)
                     except Exception as e:
                         print(f"midi error: {e}", flush=True)
-                print("MIDI input ended, reconnecting in 3s...", flush=True)
-                time.sleep(3)
-            except RuntimeError:
-                raise  # fluidsynth dead: let systemd restart us cleanly
+                print("reconnecting in 2s...", flush=True)
+                time.sleep(2)
+            except RuntimeError as e:
+                print(f"port error ({e}). Retrying in 5s...", flush=True)
+                time.sleep(5)
             except KeyboardInterrupt:
                 raise
-            except Exception as e:
-                print(f"midi lost ({e}), reconnecting in 3s...", flush=True)
-                time.sleep(3)
 
 
 def cmd_learn(config):

@@ -150,6 +150,18 @@ class FluidShell:
     def chorus_level(self, v: float):
         self.send(f"set synth.chorus.level {v:.3f}")
 
+    # -- dynamic soundfont management (lazy loading for big files) --
+    def load_font(self, path: str):
+        """Load a soundfont file live. Returns new sfont id or None."""
+        return parse_load_id(self.ask(f'load "{path}"'))
+
+    def unload_font(self, sfont_id: int):
+        self.send(f"unload {sfont_id}")
+
+    def loaded_fonts(self):
+        """Currently loaded soundfonts -> {sfont_id: path}."""
+        return parse_fonts_list(self.ask("fonts"))
+
 
 def parse_float_reply(text: str):
     """Extract first float from a shell reply ('roomsize: 0.200' -> 0.2)."""
@@ -163,7 +175,34 @@ def parse_float_reply(text: str):
         return None
 
 
-def spawn(cmd):
+def parse_load_id(text: str):
+    """'loaded SoundFont has ID 3 and bankofs=0' -> 3, else None."""
+    import re
+    m = re.search(r"[Ii][Dd]\s+(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def parse_fonts_list(text: str):
+    """Parse `fonts` output -> {sfont_id: path}."""
+    import re
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S.*\S|\S)", line)
+        if m:
+            out[int(m.group(1))] = m.group(2).strip()
+    return out
+
+
+def spawn(cmd, log_path=None):
+    """Start fluidsynth; stderr goes to log_path (or DEVNULL) for diagnosis."""
+    import os as _os
+    if log_path:
+        try:
+            _log = open(log_path, "ab")
+        except OSError:
+            _log = subprocess.DEVNULL
+    else:
+        _log = subprocess.DEVNULL
     return subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+                            stderr=_log)

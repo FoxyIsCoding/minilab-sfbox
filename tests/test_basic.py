@@ -278,5 +278,73 @@ check("sf.next.wrap", p8.handle(mido.Message("note_on", note=43, velocity=100)) 
 check("sf.prev", p8.handle(mido.Message("note_on", note=42, velocity=100)) is True
       and p8.idx == 3, p8.idx)
 
+# 13. lazy soundfont loading: partition, load-id parsing, LRU eviction
+from app import partition_files, choose_evictions
+check("part.split", partition_files([("a", 1), ("b", 9 * 1024 * 1024)], 8) ==
+      (["a"], ["b"]))
+check("part.edge", partition_files([("a", 8 * 1024 * 1024)], 8) == (["a"], []))
+check("evict.basic", choose_evictions([("a", 100), ("b", 100)], "b", 150) == ["a"])
+check("evict.keepcur", choose_evictions([("a", 100), ("b", 100)], "a", 50) == ["b"])
+check("evict.fit", choose_evictions([("a", 100)], "a", 200) == [])
+check("parse.loadid", fluidmod2.parse_load_id(
+    "loaded SoundFont has ID 3 and bankofs=0\n") == 3
+    and fluidmod2.parse_load_id("something failed") is None)
+check("parse.fonts", fluidmod2.parse_fonts_list(
+    "ID  Name\n 1  /x/gm.sf2\n 3  /y/my drums.sf2\n> ") ==
+    {1: "/x/gm.sf2", 3: "/y/my drums.sf2"})
+
+
+class StubShell:
+    def __init__(self):
+        self.next_id = 10
+        self.unloaded = []
+
+    def load_font(self, path):
+        self.next_id += 1
+        return self.next_id
+
+    def unload_font(self, sid):
+        self.unloaded.append(sid)
+
+
+os.makedirs("/tmp/opencode/lazy-test", exist_ok=True)
+small_p = "/tmp/opencode/lazy-test/small.sf2"
+big1_p = "/tmp/opencode/lazy-test/big1.sf2"
+big2_p = "/tmp/opencode/lazy-test/big2.sf2"
+for p_, n in ((small_p, 100), (big1_p, 200), (big2_p, 200)):
+    with open(p_, "wb") as f:
+        f.write(b"\0" * n)
+
+p9 = Player.__new__(Player)
+for k, v in vars(p).items():
+    setattr(p9, k, v)
+p9.lib = [{"sfont": 1, "file": small_p, "bank": 0, "prog": 0,
+           "sf": "small", "name": "S"},
+          {"sfont": 2, "file": big1_p, "bank": 0, "prog": 0,
+           "sf": "big1", "name": "B1"},
+          {"sfont": 3, "file": big2_p, "bank": 0, "prog": 0,
+           "sf": "big2", "name": "B2"}]
+p9.idx = 0
+p9.preload_ids = {small_p: 1}
+p9.dyn_ids, p9.dyn_order, p9.dyn_bytes = {}, [], 0
+p9.mem_cap = 300  # big1+big2 (400B) won't both fit
+import threading as _th
+p9._font_lock = _th.Lock()
+p9._font_gen = 0
+p9.shell = StubShell()
+check("resolve.preload", p9._resolve_font(small_p) == 1)
+check("resolve.load", p9._resolve_font(big1_p) == 11
+      and p9.dyn_bytes == 200, (p9.dyn_ids, p9.dyn_bytes))
+p9.idx = 2  # current = big2 so big1 becomes evictable
+check("resolve.evict", p9._resolve_font(big2_p) == 12
+      and p9.shell.unloaded == [11] and p9.dyn_bytes == 200,
+      (p9.shell.unloaded, p9.dyn_bytes))
+p9._reset_dyn()
+check("reset.gen", p9.dyn_ids == {} and p9._font_gen == 1)
+p9._load_q = _queue.Queue(maxsize=8)
+p9.apply(1)
+item = p9._load_q.get_nowait()
+check("enqueue.path", item == (1, big1_p, 0, 0), item)
+
 print(f"\n{len(fails)} failure(s): {fails}" if fails else "\nALL TESTS PASSED")
 sys.exit(1 if fails else 0)
