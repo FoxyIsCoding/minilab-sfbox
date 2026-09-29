@@ -89,8 +89,8 @@ Power on → ~20 s → first preset auto-loads → play. Watch with `sudo journa
 | Input | Default | Action |
 |---|---|---|
 | Display encoder | CC 28 | **Browse**: moves a `>` highlight on the display, sound unchanged |
-| Click | Pad 3 (note 38) until you map yours | **Confirm**: loads the highlighted instrument + audition blip |
-| Double-click | — | Opens the **menu** on the display (modes, see below) |
+| Click | Pad 3 (note 38) | **Confirm**: loads the highlighted instrument + audition blip |
+| Double-tap | — | Opens the **menu** on the display (modes, see below) |
 | Long press (~0.8 s) | — | **Favourites** the highlighted instrument (`*` on the display) |
 | Preset knob | CC 16 | Browse (highlight; click loads) |
 | Any piano key | — | Auditions the highlight (loads it first, `confirm.on_note`) |
@@ -126,13 +126,18 @@ the top half of its travel is **over 100%**. Under 100% it fades in one
 sub-octave (−12); past 100% it stacks a second, deeper layer (−24) up to 200%.
 Set `top_bass = 127` in `config.ini` if you want a plain 0–100 knob.
 
-### Mapping your real encoder click
+### Why a pad and not the encoder?
 
-Until `encoder_click_note`/`encoder_click_cc` is set, **pad 3 (note 38)**
-stands in for the encoder push, so click / double-click / long-press all
-already work. To map the real thing: `python3 tools/sniff.py 30`, click the
-encoder a few times, then set `encoder_click_note` (or `encoder_click_cc`) in
-`config.ini` to what you see.
+The MiniLab 3's big encoder **sends no MIDI at all when you press it** —
+confirmed by sniffing 5 single presses, a 2-second hold and a fast
+double-press: zero note-ons, zero CCs, only the usual CC28 turns. So the
+`click` gestures are bound to **pad 3 (note 38)** instead, which does send a
+clean note-on/note-off pair.
+
+Change which pad does it with `click_note` in `config.ini` (36/37 and 42/43
+are taken by prev/next preset and prev/next soundfont, so 38–41 are free).
+On a unit whose encoder *does* report a press, set `click_cc` instead and the
+encoder takes over; `0` disables the click gestures entirely.
 
 Switching soundfonts: all `.sf2` files form one long preset list, so the
 encoder and pads 1/2 cross file boundaries automatically; pads 7/8 jump

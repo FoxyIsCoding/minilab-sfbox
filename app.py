@@ -338,17 +338,12 @@ class Player:
         self.encoder_cc = int(cfg_get(config, "controls", "encoder_cc", "0"))
         self.encoder_mode = cfg_get(config, "controls", "encoder_mode",
                                     "auto").strip().lower()
-        # encoder push-to-confirm (discovered per unit; 0 = disabled)
-        self.click_note = int(cfg_get(config, "controls", "encoder_click_note", "0"))
-        self.click_cc = int(cfg_get(config, "controls", "encoder_click_cc", "0"))
-        # no real encoder click mapped yet? fall back to a spare pad so the
-        # click / double-click / long-press gestures still work out of the box.
-        self.click_is_fallback = False
-        if not (self.click_note or self.click_cc):
-            fb = int(cfg_get(config, "controls", "click_fallback_note", "38"))
-            if fb:
-                self.click_note = fb
-                self.click_is_fallback = True
+        # The "click" control: the MiniLab 3's main encoder sends nothing when
+        # pressed (verified 2026-09-29: 5 presses, 1 hold, 1 double-press all
+        # produced zero MIDI), so a spare pad is the click by default.
+        # Units whose encoder *does* report a press can use click_cc instead.
+        self.click_note = int(cfg_get(config, "controls", "click_note", "38"))
+        self.click_cc = int(cfg_get(config, "controls", "click_cc", "0"))
         # click timing (ms): single = confirm, double = menu, long = favourite
         self.click_single_ms = int(cfg_get(config, "controls", "click_single_ms", "350"))
         self.click_double_ms = int(cfg_get(config, "controls", "click_double_ms", "400"))
@@ -1416,16 +1411,15 @@ class Player:
                 self._render_current()
                 self.popup("sfbox ready", f"{len(self.lib)} presets",
                            min(127, len(self.lib)))
-                if self.click_is_fallback:
-                    print(f"  encoder click not mapped yet: pad "
-                          f"(note {self.click_note}) acts as it - "
-                          "single = confirm, double = menu, "
-                          "long = favourite. Map the real encoder with "
-                          "'python3 tools/sniff.py 30' + encoder_click_note.",
-                          flush=True)
+                if self.click_note or self.click_cc:
+                    how = (f"pad (note {self.click_note})" if self.click_note
+                           else f"CC {self.click_cc}")
+                    print(f"  {how}: single = confirm, double = menu, "
+                          "long = favourite", flush=True)
                 else:
-                    print("  click = confirm, double-click = menu, "
-                          "long press = favourite", flush=True)
+                    print("  NOTE: no click control mapped (click_note/"
+                          "click_cc = 0), so confirm/menu/favourite "
+                          "gestures are off.", flush=True)
                 print("Ready. Scroll to browse, click to load. "
                       "Ctrl-C to stop.", flush=True)
                 last_watch = time.time()
