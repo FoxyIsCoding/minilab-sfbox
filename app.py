@@ -355,8 +355,10 @@ class Player:
                 if any(k.strip().lower() in n.lower() for k in fws)]
         print(f"MIDI in: {ins}", flush=True)
         print(f"MIDI out: {outs}", flush=True)
-        # wait for both MiniLab and fluidsynth ports
-        for _ in range(120):
+        # wait for both MiniLab and fluidsynth ports, forever if needed:
+        # at boot the keyboard may be plugged in late (or not at all yet).
+        waits = 0
+        while True:
             if self.proc is not None and self.proc.poll() is not None:
                 raise RuntimeError(
                     f"fluidsynth exited (code {self.proc.returncode}). "
@@ -366,13 +368,11 @@ class Player:
                         if any(k.strip().lower() in n.lower() for k in fws)]
             if ml_in and fs_names:
                 break
+            waits += 1
+            if waits % 30 == 1:
+                print("waiting for MiniLab + fluidsynth MIDI ports... "
+                      f"({waits}s)", flush=True)
             time.sleep(1)
-            ins, outs, ml_in, ml_out_n = find_ports(mido, kws)
-            fs_names = [n for n in mido.get_output_names()
-                        if any(k.strip().lower() in n.lower() for k in fws)]
-        else:
-            raise RuntimeError("MiniLab or fluidsynth MIDI port not found. "
-                               f"in={ins} out={outs}")
         self.inport = mido.open_input(ml_in)
         # separate output handles: fluidsynth (notes) + minilab (sysex display)
         self.fs_out = mido.open_output(fs_names[0])
@@ -696,6 +696,16 @@ class Player:
                                              note=old, velocity=0))
         return out
 
+    def _close_ports(self):
+        for attr in ("inport", "fs_out", "ml_out"):
+            port = getattr(self, attr, None)
+            if port is not None:
+                try:
+                    port.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+
     def run(self):
         if not self.sf_files:
             print("soundfonts/ is empty, waiting 30s for upload then exit.",
@@ -704,21 +714,38 @@ class Player:
             return
         self.start_fluid()
         time.sleep(3)
-        self.open_ports()
-        self._sync_fx_from_synth()
-        threading.Thread(target=self._loader_loop, daemon=True).start()
-        self.apply(self.idx)
-        print("Ready. Twist preset knob / pads to switch. Ctrl-C to stop.",
-              flush=True)
-        for msg in self.inport:
+        loader_started = False
+        while True:  # survive unplug/replug without restarting fluidsynth
             try:
-                if not self.handle(msg):
-                    if self.fs_out:
-                        self.fs_out.send(msg)
-                        for extra in self.extra_for(msg):
-                            self.fs_out.send(extra)
+                self._close_ports()
+                self._subs = {}
+                self.open_ports()
+                self._sync_fx_from_synth()
+                if not loader_started:
+                    threading.Thread(target=self._loader_loop,
+                                     daemon=True).start()
+                    loader_started = True
+                self.apply(self.idx)
+                print("Ready. Twist preset knob / pads to switch. "
+                      "Ctrl-C to stop.", flush=True)
+                for msg in self.inport:
+                    try:
+                        if not self.handle(msg):
+                            if self.fs_out:
+                                self.fs_out.send(msg)
+                                for extra in self.extra_for(msg):
+                                    self.fs_out.send(extra)
+                    except Exception as e:
+                        print(f"midi error: {e}", flush=True)
+                print("MIDI input ended, reconnecting in 3s...", flush=True)
+                time.sleep(3)
+            except RuntimeError:
+                raise  # fluidsynth dead: let systemd restart us cleanly
+            except KeyboardInterrupt:
+                raise
             except Exception as e:
-                print(f"midi error: {e}", flush=True)
+                print(f"midi lost ({e}), reconnecting in 3s...", flush=True)
+                time.sleep(3)
 
 
 def cmd_learn(config):

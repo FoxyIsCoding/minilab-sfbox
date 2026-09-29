@@ -20,9 +20,19 @@ if [ -d "$APP/.git" ]; then
   git -C "$APP" checkout -q "$BRANCH"
   git -C "$APP" reset -q --hard "origin/$BRANCH"
 else
-  echo "== cloning into $APP =="
+  echo "== cloning into $APP (keeping existing soundfonts/config) =="
+  STAGE="$(mktemp -d)"
+  [ -d "$APP/soundfonts" ] && cp -r "$APP/soundfonts" "$STAGE/" 2>/dev/null || true
+  for f in config.ini state.json; do
+    [ -f "$APP/$f" ] && cp "$APP/$f" "$STAGE/" 2>/dev/null || true
+  done
   sudo rm -rf "$APP"
   sudo git clone --depth 1 --branch "$BRANCH" "$REPO" "$APP"
+  [ -d "$STAGE/soundfonts" ] && sudo cp -r "$STAGE/soundfonts" "$APP/" || true
+  for f in config.ini state.json; do
+    [ -f "$STAGE/$f" ] && sudo cp "$STAGE/$f" "$APP/" || true
+  done
+  rm -rf "$STAGE"
 fi
 sudo chown -R "$(whoami):$(whoami)" "$APP"
 bash "$APP/install.sh"

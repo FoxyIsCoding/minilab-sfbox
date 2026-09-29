@@ -231,5 +231,15 @@ check("shell.cmds", seen == ["set synth.reverb.level 0.500",
 check("shell.parse", fluidmod2.parse_float_reply("roomsize: 0.200\n> ") == 0.2
       and fluidmod2.parse_float_reply("no numbers here") is None)
 
+# 11. reconnect helper closes ports and tolerates Nones
+class FakePort:
+    def __init__(self): self.closed = False
+    def close(self): self.closed = True
+p6 = Player.__new__(Player)
+p6.inport, p6.fs_out, p6.ml_out = FakePort(), None, FakePort()
+p6._close_ports()
+check("close.ports", p6.inport is None and p6.fs_out is None
+      and p6.ml_out is None)
+
 print(f"\n{len(fails)} failure(s): {fails}" if fails else "\nALL TESTS PASSED")
 sys.exit(1 if fails else 0)

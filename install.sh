@@ -44,9 +44,19 @@ echo "== systemd service =="
 sudo cp "$HERE/minilab-sfbox.service" /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable minilab-sfbox
+echo "autostart on boot: $(sudo systemctl is-enabled minilab-sfbox 2>/dev/null || echo FAILED)"
 sudo systemctl restart minilab-sfbox || true
 sleep 2
 sudo systemctl status minilab-sfbox --no-pager || true
+
+echo "== console autologin (Pi boots straight to a logged-in shell) =="
+if command -v raspi-config >/dev/null 2>&1; then
+  sudo raspi-config nonint do_boot_behaviour B2 || true
+  echo "boot behaviour now: $(sudo raspi-config nonint get_boot_behaviour 2>/dev/null || echo ?)"
+  echo "(systemd starts minilab-sfbox at boot regardless; autologin is for the local console)"
+else
+  echo "(raspi-config not found — not a Pi? skipping autologin)"
+fi
 
 echo
 echo "DONE. Next steps:"
